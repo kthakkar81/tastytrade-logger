@@ -1,75 +1,40 @@
 """
-Tastytrade API Client (custom implementation with device challenge support)
-Handles authentication including device challenges
+Tastytrade API Client with OAuth 2.0 Authentication
+Handles token refresh automatically
 """
 import requests
+import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
-import json
 import config
 
 
 class TastytradeClient:
-    """Client for interacting with Tastytrade API with device challenge support"""
+    """Client for interacting with Tastytrade API using OAuth 2.0"""
 
     def __init__(self):
         self.api_url = config.TASTYTRADE_API_URL
-        self.username = config.TASTYTRADE_USERNAME
-        self.password = config.TASTYTRADE_PASSWORD
+        self.client_id = config.TASTYTRADE_CLIENT_ID
+        self.client_secret = config.TASTYTRADE_CLIENT_SECRET
+        self.refresh_token = config.TASTYTRADE_REFRESH_TOKEN
         self.account_number = config.TASTYTRADE_ACCOUNT_NUMBER
         self.session = requests.Session()
-        self.session_token = None
-        self.remember_token = None
+        self.access_token = None
+        self.token_expiration = 0
 
     def authenticate(self) -> bool:
         """
-        Authenticate with Tastytrade API handling device challenges
+        Authenticate with Tastytrade API using OAuth 2.0
 
         Returns:
             bool: True if authentication successful
         """
         try:
-            url = f"{self.api_url}/sessions"
-            payload = {
-                "login": self.username,
-                "password": self.password,
-                "remember-me": True
-            }
-            headers = {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json'
-            }
+            if not self.client_secret or not self.refresh_token:
+                print("✗ Missing OAuth credentials. Please set TASTYTRADE_CLIENT_SECRET and TASTYTRADE_REFRESH_TOKEN")
+                return False
 
-            print(f"Attempting authentication...")
-            response = self.session.post(url, json=payload, headers=headers)
-
-            # Handle device challenge
-            if response.status_code == 403:
-                response_data = response.json()
-                error = response_data.get('error', {})
-
-                if error.get('code') == 'device_challenge_required':
-                    print("Device challenge required, handling...")
-                    return self._handle_device_challenge(error)
-
-            # Normal authentication success
-            if response.status_code in [200, 201]:
-                data = response.json()
-                self.session_token = data['data']['session-token']
-                self.remember_token = data['data'].get('remember-token')
-
-                # Set session token for future requests
-                self.session.headers.update({
-                    'Authorization': self.session_token
-                })
-
-                print(f"✓ Authenticated as {self.username}")
-                return True
-
-            # Other errors
-            print(f"✗ Authentication failed: {response.status_code}")
-            print(f"Response: {response.text}")
-            return False
+            return self._refresh_access_token()
 
         except Exception as e:
             print(f"✗ Authentication failed: {e}")
@@ -77,117 +42,66 @@ class TastytradeClient:
             traceback.print_exc()
             return False
 
-    def _handle_device_challenge(self, error: Dict) -> bool:
+    def _refresh_access_token(self) -> bool:
         """
-        Handle device authentication challenge
-
-        Args:
-            error: Error response containing challenge information
+        Get or refresh the access token using refresh token
 
         Returns:
-            bool: True if challenge handled successfully
+            bool: True if token refresh successful
         """
         try:
-            redirect = error.get('redirect', {})
-            challenge_url = redirect.get('url')
-
-            if not challenge_url:
-                print("✗ No challenge URL provided")
-                return False
-
-            # Request device challenge
-            url = f"{self.api_url}{challenge_url}"
+            url = f"{self.api_url}/oauth/token"
             payload = {
-                "login": self.username,
-                "password": self.password
+                "grant_type": "refresh_token",
+                "client_secret": self.client_secret,
+                "refresh_token": self.refresh_token
             }
             headers = {
                 'Content-Type': 'application/json',
                 'Accept': 'application/json'
             }
 
-            print(f"Requesting device challenge at: {url}")
             response = self.session.post(url, json=payload, headers=headers)
 
             if response.status_code in [200, 201]:
                 data = response.json()
-                challenge_token = data.get('data', {}).get('challenge-token')
+                self.access_token = data.get('access_token')
+                expires_in = data.get('expires_in', 900)  # Default 15 minutes
 
-                if challenge_token:
-                    print("✓ Device challenge token received")
-                    print(f"Challenge token: {challenge_token}")
+                # Set expiration time with 60 second buffer
+                self.token_expiration = time.time() + expires_in - 60
 
-                    # Now retry authentication with challenge token
-                    return self._authenticate_with_challenge(challenge_token)
-                else:
-                    print("✗ No challenge token in response")
-                    print(f"Response: {response.text}")
-                    return False
-
-            print(f"✗ Device challenge request failed: {response.status_code}")
-            print(f"Response: {response.text}")
-            return False
-
-        except Exception as e:
-            print(f"✗ Device challenge handling failed: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-
-    def _authenticate_with_challenge(self, challenge_token: str) -> bool:
-        """
-        Complete authentication with device challenge token
-
-        Args:
-            challenge_token: Device challenge token
-
-        Returns:
-            bool: True if authentication successful
-        """
-        try:
-            url = f"{self.api_url}/sessions"
-            payload = {
-                "login": self.username,
-                "password": self.password,
-                "remember-me": True
-            }
-            headers = {
-                'Content-Type': 'application/json',
-                'Accept': 'application/json',
-                'X-Tastyworks-Challenge-Token': challenge_token
-            }
-
-            print("Completing authentication with challenge token...")
-            response = self.session.post(url, json=payload, headers=headers)
-
-            if response.status_code in [200, 201]:
-                data = response.json()
-                self.session_token = data['data']['session-token']
-                self.remember_token = data['data'].get('remember-token')
-
-                # Set session token for future requests
+                # Update session headers with new access token
                 self.session.headers.update({
-                    'Authorization': self.session_token
+                    'Authorization': f'Bearer {self.access_token}'
                 })
 
-                print(f"✓ Authenticated successfully with device challenge")
-
-                # Save remember token for future use
-                if self.remember_token:
-                    print(f"✓ Remember token received (save this for future sessions)")
-                    print(f"Remember token: {self.remember_token}")
-
+                print(f"✓ OAuth authenticated (token expires in {expires_in}s)")
                 return True
-
-            print(f"✗ Authentication with challenge failed: {response.status_code}")
-            print(f"Response: {response.text}")
-            return False
+            else:
+                print(f"✗ Token refresh failed: {response.status_code}")
+                print(f"Response: {response.text}")
+                return False
 
         except Exception as e:
-            print(f"✗ Authentication with challenge failed: {e}")
+            print(f"✗ Token refresh failed: {e}")
             import traceback
             traceback.print_exc()
             return False
+
+    def _ensure_authenticated(self) -> bool:
+        """
+        Ensure we have a valid access token, refreshing if needed
+
+        Returns:
+            bool: True if authenticated
+        """
+        # Check if token needs refresh (within 60 seconds of expiration)
+        if time.time() >= self.token_expiration:
+            print("Token expired, refreshing...")
+            return self._refresh_access_token()
+
+        return True
 
     def get_transactions(self, start_date: Optional[str] = None,
                         end_date: Optional[str] = None,
@@ -203,8 +117,12 @@ class TastytradeClient:
         Returns:
             List of transaction dictionaries
         """
-        if not self.session_token:
+        if not self.access_token:
             raise Exception("Not authenticated. Call authenticate() first.")
+
+        # Ensure token is valid
+        if not self._ensure_authenticated():
+            raise Exception("Failed to refresh access token")
 
         # Default to yesterday if no start date provided
         if not start_date:
@@ -257,8 +175,12 @@ class TastytradeClient:
         Returns:
             List of position dictionaries with current market values
         """
-        if not self.session_token:
+        if not self.access_token:
             raise Exception("Not authenticated. Call authenticate() first.")
+
+        # Ensure token is valid
+        if not self._ensure_authenticated():
+            raise Exception("Failed to refresh access token")
 
         try:
             url = f"{self.api_url}/accounts/{self.account_number}/positions"
@@ -282,8 +204,12 @@ class TastytradeClient:
         Returns:
             Dictionary with balance information
         """
-        if not self.session_token:
+        if not self.access_token:
             raise Exception("Not authenticated. Call authenticate() first.")
+
+        # Ensure token is valid
+        if not self._ensure_authenticated():
+            raise Exception("Failed to refresh access token")
 
         try:
             url = f"{self.api_url}/accounts/{self.account_number}/balances"
@@ -293,7 +219,7 @@ class TastytradeClient:
             data = response.json()
             balances = data['data']
 
-            cash_balance = balances.get('cash-balance', 0)
+            cash_balance = float(balances.get('cash-balance', 0))
             print(f"✓ Account balance: ${cash_balance:,.2f}")
             return balances
 
@@ -301,16 +227,58 @@ class TastytradeClient:
             print(f"✗ Failed to fetch balances: {e}")
             return {}
 
+    def get_customer_accounts(self) -> List[Dict]:
+        """
+        Get all accounts for the authenticated user
+
+        Returns:
+            List of account dictionaries
+        """
+        if not self.access_token:
+            raise Exception("Not authenticated. Call authenticate() first.")
+
+        # Ensure token is valid
+        if not self._ensure_authenticated():
+            raise Exception("Failed to refresh access token")
+
+        try:
+            url = f"{self.api_url}/customers/me/accounts"
+            response = self.session.get(url)
+            response.raise_for_status()
+
+            data = response.json()
+            accounts = data['data']['items']
+
+            print(f"✓ Found {len(accounts)} account(s):")
+            for acc in accounts:
+                print(f"  - Account: {acc.get('account', {}).get('account-number')} ({acc.get('account', {}).get('nickname', 'No nickname')})")
+
+            return accounts
+
+        except Exception as e:
+            print(f"✗ Failed to fetch accounts: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+
 
 # Test function
 def test_api():
     """Test API connection and basic endpoints"""
-    print("Testing Tastytrade API connection...\n")
+    print("Testing Tastytrade API connection with OAuth...\n")
 
     client = TastytradeClient()
 
     # Test authentication
     if not client.authenticate():
+        return
+
+    # First, get accounts to find correct account number
+    print("\nFetching customer accounts...")
+    accounts = client.get_customer_accounts()
+
+    if not accounts:
+        print("✗ No accounts found")
         return
 
     # Test fetching transactions
