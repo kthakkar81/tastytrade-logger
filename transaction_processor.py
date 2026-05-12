@@ -236,22 +236,23 @@ class TransactionProcessor:
 
     def _get_expiration(self, leg: Dict) -> str:
         """Extract option expiration date"""
+        symbol = leg.get('symbol', '')
+
         # Expiration might be in instrument data or symbol
         expires_at = leg.get('expires-at')
         if expires_at:
             dt = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
             return dt.strftime('%m/%d/%Y')
 
-        # Try parsing from symbol (e.g., "COIN  260501P00190000")
+        # Try parsing from symbol (e.g., "COIN  260501P00190000" or "SPXW 260424P6970")
         # Format: <UNDERLYING><SPACES><YYMMDD><P/C><STRIKE>
-        symbol = leg.get('symbol', '')
 
         # Find the P or C delimiter and extract 6 digits before it
         for delimiter in ['P', 'C']:
             if delimiter in symbol:
-                # Find position of delimiter
-                delim_pos = symbol.index(delimiter)
-                # Extract 6 characters before it (the date)
+                # Find position of delimiter (use last occurrence for symbols with multiple P/C)
+                delim_pos = symbol.rfind(delimiter)
+                # Extract up to 6 characters before it (the date)
                 if delim_pos >= 6:
                     date_str = symbol[delim_pos-6:delim_pos].strip()
                     if len(date_str) == 6 and date_str.isdigit():
@@ -260,6 +261,18 @@ class TransactionProcessor:
                             return dt.strftime('%m/%d/%Y')
                         except:
                             pass
+
+                # Also try 6 characters without stripping (for symbols like "SPXW 260424P6970")
+                if delim_pos >= 6:
+                    # Look backwards for 6 consecutive digits
+                    for start in range(max(0, delim_pos - 10), delim_pos - 5):
+                        date_str = symbol[start:start+6]
+                        if date_str.isdigit() and len(date_str) == 6:
+                            try:
+                                dt = datetime.strptime(date_str, '%y%m%d')
+                                return dt.strftime('%m/%d/%Y')
+                            except:
+                                pass
                 break
 
         return ''
@@ -510,17 +523,21 @@ class TransactionProcessor:
                     sell_strike = self._extract_strike_from_symbol(sell_symbol)
 
                     # Invert: Buy to Close means it was originally sold
-                    # If we're buying to close the higher strike = Bear Call Spread
-                    # If we're buying to close the lower strike = Bull Call Spread
+                    # For Bull Call: originally Buy lower, Sell higher
+                    #   When closing: Sell to Close lower, Buy to Close higher
+                    #   So: sell_strike < buy_strike
+                    # For Bear Call: originally Sell lower, Buy higher
+                    #   When closing: Buy to Close lower, Sell to Close higher
+                    #   So: buy_strike < sell_strike
                     if buy_strike and sell_strike:
-                        if buy_strike > sell_strike:
-                            # Closing: Buy higher, Sell lower = was originally Sell higher, Buy lower = Bear Call
-                            return 'Bear Call Spread'
-                        else:
-                            # Closing: Buy lower, Sell higher = was originally Sell lower, Buy higher = Bull Call
+                        if sell_strike < buy_strike:
+                            # Closing: Sell lower, Buy higher = was originally Buy lower, Sell higher = Bull Call
                             return 'Bull Call Spread'
+                        else:
+                            # Closing: Buy lower, Sell higher = was originally Sell lower, Buy higher = Bear Call
+                            return 'Bear Call Spread'
 
-                    return 'Bear Call Spread'
+                    return 'Bull Call Spread'
 
         elif num_legs == 4:
             # Likely Iron Condor
