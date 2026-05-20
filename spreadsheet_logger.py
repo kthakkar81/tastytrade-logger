@@ -59,6 +59,14 @@ class SpreadsheetLogger:
             # Get or create error log sheet
             try:
                 self.error_sheet = spreadsheet.worksheet('Import Errors')
+                # Verify header exists and is correct
+                first_row = self.error_sheet.row_values(1)
+                expected_header = ['Date', 'Underlying', 'Strategy', 'Expiration',
+                                 'Strikes', 'Action', 'Error', 'Details']
+                if first_row != expected_header:
+                    # Clear and add proper header
+                    self.error_sheet.clear()
+                    self.error_sheet.append_row(expected_header)
             except:
                 # Create error sheet if it doesn't exist
                 self.error_sheet = spreadsheet.add_worksheet(title='Import Errors', rows=100, cols=10)
@@ -455,6 +463,13 @@ class SpreadsheetLogger:
 
         try:
             action = trade.get('action', '')
+            strategy = trade.get('strategy', trade.get('new_strategy', ''))
+
+            # Check for Unknown strategy - log to errors
+            if strategy == 'Unknown':
+                self.log_error(trade, 'Unknown strategy - could not classify')
+                print(f"✗ Unknown strategy for {trade.get('underlying')} - logged to Import Errors")
+                return False
 
             # For CLOSE trades, try to find and update existing OPEN row
             if action == 'CLOSE':
@@ -464,18 +479,21 @@ class SpreadsheetLogger:
                 else:
                     # No matching OPEN found - log to error sheet instead
                     self.log_error(trade, 'No matching OPEN found')
-                    print(f"✗ No matching OPEN for {trade.get('underlying')} {trade.get('strategy')} - logged to Import Errors")
+                    print(f"✗ No matching OPEN for {trade.get('underlying')} {strategy} - logged to Import Errors")
                     return False
 
             # For OPEN trades, append new row
             row = self.format_trade_row(trade)
             self.sheet.append_row(row)
 
-            print(f"✓ Logged {action} {trade.get('underlying')} {trade.get('strategy', trade.get('new_strategy', ''))}")
+            print(f"✓ Logged {action} {trade.get('underlying')} {strategy}")
             return True
 
         except Exception as e:
-            print(f"✗ Failed to append trade: {e}")
+            # Log any processing errors to Import Errors sheet
+            error_msg = f"Processing error: {str(e)}"
+            self.log_error(trade, error_msg)
+            print(f"✗ Failed to append trade: {e} - logged to Import Errors")
             import traceback
             traceback.print_exc()
             return False
@@ -506,6 +524,8 @@ class SpreadsheetLogger:
             self.error_sheet.append_row(error_row)
         except Exception as e:
             print(f"⚠ Failed to log error: {e}")
+            import traceback
+            traceback.print_exc()
 
     def append_trades(self, trades: List[Dict]) -> int:
         """
@@ -556,7 +576,7 @@ def test_logger():
     if not client.authenticate():
         return
 
-    transactions = client.get_transactions(start_date='2026-05-11', end_date='2026-05-11')
+    transactions = client.get_transactions(start_date='2026-05-19', end_date='2026-05-19')
 
     processor = TransactionProcessor()
     processor.load_transactions(transactions)
