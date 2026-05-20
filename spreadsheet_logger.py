@@ -369,7 +369,7 @@ class SpreadsheetLogger:
             close_fees = trade.get('fees', 0)
 
             # Parse existing data
-            open_net_price_str = existing_row[10].replace('$', '').replace(',', '') if len(existing_row) > 10 and existing_row[10] else '0'
+            open_net_price_str = existing_row[10].replace('$', '').replace(',', '').replace('(', '-').replace(')', '') if len(existing_row) > 10 and existing_row[10] else '0'
             open_net_price = float(open_net_price_str)
 
             existing_fees_str = existing_row[9].replace('$', '').replace(',', '') if len(existing_row) > 9 and existing_row[9] else '0'
@@ -381,9 +381,9 @@ class SpreadsheetLogger:
             # Calculate cumulative fees
             total_fees = existing_fees + close_fees
 
-            # Calculate P&L: (opening net price + closing net price) * contracts * 100
-            # Column K + Column L, then multiply by contracts * 100
-            total_pnl = (open_net_price + close_net_price) * contracts * 100
+            # Calculate P&L: Column K + Column L
+            # K and L are already total values for all contracts
+            total_pnl = open_net_price + close_net_price
 
             # Calculate ROC (return on capital)
             # For spreads: capital at risk = width * contracts * 100
