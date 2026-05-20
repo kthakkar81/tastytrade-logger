@@ -527,6 +527,65 @@ class SpreadsheetLogger:
             import traceback
             traceback.print_exc()
 
+    def _aggregate_close_trades(self, trades: List[Dict]) -> List[Dict]:
+        """
+        Aggregate multiple CLOSE trades for the same position into one combined trade
+
+        Args:
+            trades: List of all trades
+
+        Returns:
+            List of trades with CLOSE trades aggregated
+        """
+        from collections import defaultdict
+
+        # Separate CLOSE trades from others
+        close_trades = [t for t in trades if t.get('action') == 'CLOSE']
+        other_trades = [t for t in trades if t.get('action') != 'CLOSE']
+
+        if not close_trades:
+            return trades
+
+        # Group CLOSE trades by position key
+        grouped = defaultdict(list)
+        for trade in close_trades:
+            # Normalize strikes for comparison
+            strikes = self._parse_strikes(trade.get('strikes', ''), trade.get('strategy', ''))
+            key = (
+                trade.get('underlying', ''),
+                trade.get('strategy', ''),
+                trade.get('expiration', ''),
+                strikes['short'],
+                strikes['long'],
+                trade.get('trade_date', '')
+            )
+            grouped[key].append(trade)
+
+        # Aggregate groups with multiple trades
+        aggregated_closes = []
+        for key, group in grouped.items():
+            if len(group) == 1:
+                # Single trade, no aggregation needed
+                aggregated_closes.append(group[0])
+            else:
+                # Multiple trades - aggregate them
+                print(f"  Aggregating {len(group)} CLOSE trades for {group[0].get('underlying')} {group[0].get('strategy')}")
+
+                # Sum quantities, net_price, and fees
+                total_quantity = sum(t.get('quantity', 0) for t in group)
+                total_net_price = sum(t.get('net_price', 0) for t in group)
+                total_fees = sum(t.get('fees', 0) for t in group)
+
+                # Create aggregated trade using first trade as template
+                aggregated = group[0].copy()
+                aggregated['quantity'] = total_quantity
+                aggregated['net_price'] = total_net_price
+                aggregated['fees'] = total_fees
+                aggregated_closes.append(aggregated)
+
+        # Return all trades with aggregated closes
+        return other_trades + aggregated_closes
+
     def append_trades(self, trades: List[Dict]) -> int:
         """
         Append multiple trades to the spreadsheet
@@ -537,6 +596,9 @@ class SpreadsheetLogger:
         Returns:
             Number of trades successfully logged
         """
+        # Aggregate CLOSE trades for the same position
+        trades = self._aggregate_close_trades(trades)
+
         # Sort trades: OPENs before CLOSEs, then by date
         # This ensures same-day open/close pairs can match
         def sort_key(trade):
@@ -576,7 +638,7 @@ def test_logger():
     if not client.authenticate():
         return
 
-    transactions = client.get_transactions(start_date='2026-05-19', end_date='2026-05-19')
+    transactions = client.get_transactions(start_date='2026-05-20', end_date='2026-05-20')
 
     processor = TransactionProcessor()
     processor.load_transactions(transactions)
