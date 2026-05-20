@@ -475,7 +475,19 @@ class SpreadsheetLogger:
             if action == 'CLOSE':
                 row_num = self.find_open_trade(trade)
                 if row_num:
-                    return self.update_close_trade(row_num, trade)
+                    # Verify quantities match before updating
+                    existing_row = self.sheet.row_values(row_num)
+                    existing_qty_str = existing_row[12] if len(existing_row) > 12 and existing_row[12] else '0'
+                    existing_qty = int(float(existing_qty_str))
+                    close_qty = trade.get('quantity', 0)
+
+                    if existing_qty == close_qty:
+                        return self.update_close_trade(row_num, trade)
+                    else:
+                        # Quantity mismatch - log to errors instead of updating
+                        self.log_error(trade, f'Quantity mismatch: OPEN={existing_qty}, CLOSE={close_qty}')
+                        print(f"✗ Quantity mismatch for {trade.get('underlying')} {strategy} (OPEN={existing_qty}, CLOSE={close_qty}) - logged to Import Errors")
+                        return False
                 else:
                     # No matching OPEN found - log to error sheet instead
                     self.log_error(trade, 'No matching OPEN found')
