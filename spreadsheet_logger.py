@@ -112,7 +112,18 @@ class SpreadsheetLogger:
             net_price = trade.get('net_price', 0)
 
             # Parse strikes
-            strikes = self._parse_strikes(trade.get('strikes', ''), strategy)
+            strikes_str = trade.get('strikes', '')
+            strikes = self._parse_strikes(strikes_str, strategy)
+
+            # For IC (Iron Condor), put strikes in notes and leave strike columns blank
+            if strategy == 'IC':
+                notes = f"Strikes: {strikes_str}"
+                short_strike = ''
+                long_strike = ''
+            else:
+                notes = ''
+                short_strike = strikes['short']
+                long_strike = strikes['long']
 
             row = [
                 opening_date,           # Opening Date
@@ -121,8 +132,8 @@ class SpreadsheetLogger:
                 strategy,               # Strategy Type
                 status,                 # Status
                 expiration,             # Expiration
-                strikes['short'],       # Short/CSP/CC Strike
-                strikes['long'],        # Long Strike
+                short_strike,           # Short/CSP/CC Strike
+                long_strike,            # Long Strike
                 '',                     # Delta (blank for now)
                 f"${fees:.2f}",         # Fees
                 f"${net_price:.2f}",    # Opening Net Price
@@ -130,7 +141,7 @@ class SpreadsheetLogger:
                 str(quantity),          # Contracts
                 '',                     # Total PnL (blank for opens)
                 '',                     # ROC (blank for now)
-                ''                      # Notes/Setup
+                notes                   # Notes/Setup
             ]
 
         elif action == 'CLOSE':
@@ -141,7 +152,18 @@ class SpreadsheetLogger:
             status = 'Closed'
             net_price = trade.get('net_price', 0)
 
-            strikes = self._parse_strikes(trade.get('strikes', ''), strategy)
+            strikes_str = trade.get('strikes', '')
+            strikes = self._parse_strikes(strikes_str, strategy)
+
+            # For IC (Iron Condor), put strikes in notes and leave strike columns blank
+            if strategy == 'IC':
+                notes = f"Strikes: {strikes_str}"
+                short_strike = ''
+                long_strike = ''
+            else:
+                notes = ''
+                short_strike = strikes['short']
+                long_strike = strikes['long']
 
             row = [
                 opening_date,           # Opening Date (blank - manual match needed)
@@ -150,8 +172,8 @@ class SpreadsheetLogger:
                 strategy,               # Strategy Type
                 status,                 # Status
                 expiration,             # Expiration
-                strikes['short'],       # Short/CSP/CC Strike
-                strikes['long'],        # Long Strike
+                short_strike,           # Short/CSP/CC Strike
+                long_strike,            # Long Strike
                 '',                     # Delta
                 f"${fees:.2f}",         # Fees
                 '',                     # Opening Net Price (blank)
@@ -159,7 +181,7 @@ class SpreadsheetLogger:
                 str(quantity),          # Contracts
                 '',                     # Total PnL (calculate manually)
                 '',                     # ROC
-                ''                      # Notes
+                notes                   # Notes
             ]
 
         elif action == 'ROLL':
@@ -296,7 +318,8 @@ class SpreadsheetLogger:
             underlying = trade.get('underlying', '')
             strategy = trade.get('strategy', '')
             expiration = trade.get('expiration', '')
-            strikes = self._parse_strikes(trade.get('strikes', ''), strategy)
+            strikes_str = trade.get('strikes', '')
+            strikes = self._parse_strikes(strikes_str, strategy)
 
             # Normalize expiration date format (remove leading zeros for comparison)
             # Convert "05/29/2026" to "5/29/2026"
@@ -324,24 +347,35 @@ class SpreadsheetLogger:
                 if len(row) < 8:
                     continue
 
-                # Column indices: 2=Underlying, 3=Strategy, 4=Status, 5=Expiration, 6=Short Strike, 7=Long Strike
+                # Column indices: 2=Underlying, 3=Strategy, 4=Status, 5=Expiration, 6=Short Strike, 7=Long Strike, 15=Notes
                 row_underlying = row[2]
                 row_strategy = row[3]
                 row_status = row[4]
                 row_expiration = row[5]
                 row_short_strike = row[6]
                 row_long_strike = row[7]
+                row_notes = row[15] if len(row) > 15 else ''
 
                 # Normalize row expiration for comparison
                 row_expiration_normalized = normalize_date(row_expiration)
 
                 # Match criteria: same underlying, strategy, expiration, strikes, and status is "Open"
+                # For IC (Iron Condor), also match on strikes in notes
+                strikes_match = False
+                if strategy == 'IC':
+                    # Compare strikes from notes field
+                    if f"Strikes: {strikes_str}" in row_notes:
+                        strikes_match = True
+                else:
+                    # Compare individual strike columns
+                    strikes_match = (row_short_strike == strikes['short'] and
+                                   row_long_strike == strikes['long'])
+
                 if (row_underlying == underlying and
                     row_strategy == strategy and
                     row_status == 'Open' and
                     row_expiration_normalized == expiration_normalized and
-                    row_short_strike == strikes['short'] and
-                    row_long_strike == strikes['long']):
+                    strikes_match):
 
                     return i + 1  # Return 1-indexed row number
 

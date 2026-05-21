@@ -247,33 +247,31 @@ class TransactionProcessor:
         # Try parsing from symbol (e.g., "COIN  260501P00190000" or "SPXW 260424P6970")
         # Format: <UNDERLYING><SPACES><YYMMDD><P/C><STRIKE>
 
-        # Find the P or C delimiter and extract 6 digits before it
-        for delimiter in ['P', 'C']:
-            if delimiter in symbol:
-                # Find position of delimiter (use last occurrence for symbols with multiple P/C)
-                delim_pos = symbol.rfind(delimiter)
-                # Extract up to 6 characters before it (the date)
-                if delim_pos >= 6:
-                    date_str = symbol[delim_pos-6:delim_pos].strip()
-                    if len(date_str) == 6 and date_str.isdigit():
-                        try:
-                            dt = datetime.strptime(date_str, '%y%m%d')
-                            return dt.strftime('%m/%d/%Y')
-                        except:
-                            pass
+        # Find the option type delimiter (last P or C in symbol)
+        p_pos = symbol.rfind('P')
+        c_pos = symbol.rfind('C')
+        delim_pos = max(p_pos, c_pos)  # Use whichever comes last (the option type)
 
-                # Also try 6 characters without stripping (for symbols like "SPXW 260424P6970")
-                if delim_pos >= 6:
-                    # Look backwards for 6 consecutive digits
-                    for start in range(max(0, delim_pos - 10), delim_pos - 5):
-                        date_str = symbol[start:start+6]
-                        if date_str.isdigit() and len(date_str) == 6:
-                            try:
-                                dt = datetime.strptime(date_str, '%y%m%d')
-                                return dt.strftime('%m/%d/%Y')
-                            except:
-                                pass
-                break
+        if delim_pos >= 6:
+            # Extract 6 characters before the delimiter (the date)
+            date_str = symbol[delim_pos-6:delim_pos].strip()
+            if len(date_str) == 6 and date_str.isdigit():
+                try:
+                    dt = datetime.strptime(date_str, '%y%m%d')
+                    return dt.strftime('%m/%d/%Y')
+                except:
+                    pass
+
+            # Also try 6 characters without stripping (for symbols like "SPXW 260424P6970")
+            # Look backwards for 6 consecutive digits
+            for start in range(max(0, delim_pos - 10), delim_pos - 5):
+                date_str = symbol[start:start+6]
+                if date_str.isdigit() and len(date_str) == 6:
+                    try:
+                        dt = datetime.strptime(date_str, '%y%m%d')
+                        return dt.strftime('%m/%d/%Y')
+                    except:
+                        pass
 
         return ''
 
@@ -402,9 +400,21 @@ class TransactionProcessor:
 
         elif num_legs == 2:
             # Check if both are same type (puts or calls)
+            # Look for P/C after the date in OCC format (avoid matching ticker like PLTR)
             symbols = [leg.get('symbol', '') for leg in legs]
-            is_puts = all('P' in sym for sym in symbols)
-            is_calls = all('C' in sym for sym in symbols)
+
+            def get_option_type(symbol):
+                """Extract option type (P or C) from OCC symbol"""
+                # Find the last occurrence of P or C (the option type indicator)
+                if symbol.rfind('P') > symbol.rfind('C'):
+                    return 'P'
+                elif symbol.rfind('C') > symbol.rfind('P'):
+                    return 'C'
+                return None
+
+            option_types = [get_option_type(sym) for sym in symbols]
+            is_puts = all(ot == 'P' for ot in option_types if ot)
+            is_calls = all(ot == 'C' for ot in option_types if ot)
 
             if is_puts:
                 # Check which one is sold (short strike)
@@ -450,13 +460,8 @@ class TransactionProcessor:
                     return 'Bear Call Spread'
 
         elif num_legs == 4:
-            # Likely Iron Condor
-            symbols = [leg.get('symbol', '') for leg in legs]
-            num_puts = sum(1 for sym in symbols if 'P' in sym)
-            num_calls = sum(1 for sym in symbols if 'C' in sym)
-
-            if num_puts == 2 and num_calls == 2:
-                return 'Iron Condor'
+            # 4-leg spread - classify as IC (Iron Condor)
+            return 'IC'
 
         return 'Unknown'
 
@@ -494,9 +499,21 @@ class TransactionProcessor:
 
         elif num_legs == 2:
             # Check if both are same type (puts or calls)
+            # Look for P/C after the date in OCC format (avoid matching ticker like PLTR)
             symbols = [leg.get('symbol', '') for leg in legs]
-            is_puts = all('P' in sym for sym in symbols)
-            is_calls = all('C' in sym for sym in symbols)
+
+            def get_option_type(symbol):
+                """Extract option type (P or C) from OCC symbol"""
+                # Find the last occurrence of P or C (the option type indicator)
+                if symbol.rfind('P') > symbol.rfind('C'):
+                    return 'P'
+                elif symbol.rfind('C') > symbol.rfind('P'):
+                    return 'C'
+                return None
+
+            option_types = [get_option_type(sym) for sym in symbols]
+            is_puts = all(ot == 'P' for ot in option_types if ot)
+            is_calls = all(ot == 'C' for ot in option_types if ot)
 
             if is_puts:
                 # Check which one was closed with Buy to Close (was originally short)
@@ -540,13 +557,8 @@ class TransactionProcessor:
                     return 'Bull Call Spread'
 
         elif num_legs == 4:
-            # Likely Iron Condor
-            symbols = [leg.get('symbol', '') for leg in legs]
-            num_puts = sum(1 for sym in symbols if 'P' in sym)
-            num_calls = sum(1 for sym in symbols if 'C' in sym)
-
-            if num_puts == 2 and num_calls == 2:
-                return 'Iron Condor'
+            # 4-leg spread - classify as IC (Iron Condor)
+            return 'IC'
 
         return 'Unknown'
 
