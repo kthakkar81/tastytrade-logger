@@ -231,7 +231,7 @@ class TransactionProcessor:
         executed_at = leg.get('executed-at', '')
         if executed_at:
             dt = datetime.fromisoformat(executed_at.replace('Z', '+00:00'))
-            return dt.strftime('%-m/%-d/%Y')
+            return dt.strftime('%m/%d/%Y')
         return ''
 
     def _get_expiration(self, leg: Dict) -> str:
@@ -242,7 +242,7 @@ class TransactionProcessor:
         expires_at = leg.get('expires-at')
         if expires_at:
             dt = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
-            return dt.strftime('%-m/%-d/%Y')
+            return dt.strftime('%m/%d/%Y')
 
         # Try parsing from symbol (e.g., "COIN  260501P00190000" or "SPXW 260424P6970")
         # Format: <UNDERLYING><SPACES><YYMMDD><P/C><STRIKE>
@@ -258,7 +258,7 @@ class TransactionProcessor:
             if len(date_str) == 6 and date_str.isdigit():
                 try:
                     dt = datetime.strptime(date_str, '%y%m%d')
-                    return dt.strftime('%-m/%-d/%Y')
+                    return dt.strftime('%m/%d/%Y')
                 except:
                     pass
 
@@ -269,7 +269,7 @@ class TransactionProcessor:
                 if date_str.isdigit() and len(date_str) == 6:
                     try:
                         dt = datetime.strptime(date_str, '%y%m%d')
-                        return dt.strftime('%-m/%-d/%Y')
+                        return dt.strftime('%m/%d/%Y')
                     except:
                         pass
 

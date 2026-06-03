@@ -85,20 +85,6 @@ class SpreadsheetLogger:
             traceback.print_exc()
             return False
 
-    def _parse_date(self, date_str: str):
-        """
-        Keep date string as-is for Google Sheets (will be recognized as date by Sheets)
-
-        Args:
-            date_str: Date string in format "6/2/2026" or "06/02/2026"
-
-        Returns:
-            Date string (Google Sheets will auto-detect and format as date)
-        """
-        # Just return the string as-is - Google Sheets will recognize "6/2/2026" as a date
-        # when using value_input_option='USER_ENTERED'
-        return date_str if date_str else ''
-
     def format_trade_row(self, trade: Dict) -> List[str]:
         """
         Format a processed trade into spreadsheet row format
@@ -120,7 +106,7 @@ class SpreadsheetLogger:
 
         if action == 'OPEN':
             # Opening transaction
-            opening_date = self._parse_date(trade.get('trade_date', ''))
+            opening_date = trade.get('trade_date', '')
             closing_date = ''
             status = 'Open'
             net_price = trade.get('net_price', 0)
@@ -140,19 +126,19 @@ class SpreadsheetLogger:
                 long_strike = strikes['long']
 
             row = [
-                opening_date,           # Opening Date (datetime object)
+                opening_date,           # Opening Date
                 closing_date,           # Closing Date (blank for opens)
                 underlying,             # Underlying
                 strategy,               # Strategy Type
                 status,                 # Status
-                self._parse_date(expiration),  # Expiration (datetime object)
+                expiration,             # Expiration
                 short_strike,           # Short/CSP/CC Strike
                 long_strike,            # Long Strike
                 '',                     # Delta (blank for now)
-                fees,                   # Fees (number)
-                net_price,              # Opening Net Price (number)
+                f"${fees:.2f}",         # Fees
+                f"${net_price:.2f}",    # Opening Net Price
                 '',                     # Closing Net Price (blank for opens)
-                quantity,               # Contracts (number)
+                str(quantity),          # Contracts
                 '',                     # Total PnL (blank for opens)
                 '',                     # ROC (blank for now)
                 notes                   # Notes/Setup
@@ -162,7 +148,7 @@ class SpreadsheetLogger:
             # Closing transaction - log as separate row for now
             # TODO: Could enhance to find and update matching open row
             opening_date = ''
-            closing_date = self._parse_date(trade.get('trade_date', ''))
+            closing_date = trade.get('trade_date', '')
             status = 'Closed'
             net_price = trade.get('net_price', 0)
 
@@ -181,18 +167,18 @@ class SpreadsheetLogger:
 
             row = [
                 opening_date,           # Opening Date (blank - manual match needed)
-                closing_date,           # Closing Date (datetime object)
+                closing_date,           # Closing Date
                 underlying,             # Underlying
                 strategy,               # Strategy Type
                 status,                 # Status
-                self._parse_date(expiration),  # Expiration (datetime object)
+                expiration,             # Expiration
                 short_strike,           # Short/CSP/CC Strike
                 long_strike,            # Long Strike
                 '',                     # Delta
-                fees,                   # Fees (number)
+                f"${fees:.2f}",         # Fees
                 '',                     # Opening Net Price (blank)
-                net_price,              # Closing Net Price (number)
-                quantity,               # Contracts (number)
+                f"${net_price:.2f}",    # Closing Net Price
+                str(quantity),          # Contracts
                 '',                     # Total PnL (calculate manually)
                 '',                     # ROC
                 notes                   # Notes
@@ -202,7 +188,7 @@ class SpreadsheetLogger:
             # Roll = close old + open new
             # For now, return the new opening position
             # TODO: Could log both the close and the new open
-            opening_date = self._parse_date(trade.get('trade_date', ''))
+            opening_date = trade.get('trade_date', '')
             closing_date = ''
             status = 'Open'
             net_price = trade.get('open_net_price', 0)
@@ -211,22 +197,22 @@ class SpreadsheetLogger:
             strikes = self._parse_strikes(trade.get('new_strikes', ''), trade.get('new_strategy', ''))
 
             row = [
-                opening_date,           # Opening Date (datetime object)
+                opening_date,
                 closing_date,
                 underlying,
                 trade.get('new_strategy', ''),
                 status,
-                self._parse_date(trade.get('new_expiration', '')),  # Expiration (datetime object)
+                trade.get('new_expiration', ''),
                 strikes['short'],
                 strikes['long'],
                 '',
-                fees,                   # Fees (number)
-                net_price,              # Opening Net Price (number)
+                f"${fees:.2f}",
+                f"${net_price:.2f}",
                 '',
-                quantity,               # Contracts (number)
+                str(quantity),
                 '',
                 '',
-                f"Roll credit: ${roll_credit:.2f}"  # Keep formatted in notes
+                f"Roll credit: ${roll_credit:.2f}"
             ]
 
         else:
@@ -473,19 +459,28 @@ class SpreadsheetLogger:
             roc = (total_pnl / capital_at_risk * 100) if capital_at_risk > 0 else 0
 
             # Update cells (1-indexed columns)
-            # Parse closing date to datetime object
-            closing_date_obj = self._parse_date(closing_date)
-
             updates = [
-                {'range': f'B{row_num}', 'values': [[closing_date_obj]]},  # Closing Date (datetime)
+                {'range': f'B{row_num}', 'values': [[closing_date]]},  # Closing Date
                 {'range': f'E{row_num}', 'values': [['Closed']]},  # Status
-                {'range': f'J{row_num}', 'values': [[total_fees]]},  # Fees (number)
-                {'range': f'L{row_num}', 'values': [[close_net_price]]},  # Closing Net Price (number)
-                {'range': f'N{row_num}', 'values': [[total_pnl]]},  # Total PnL (number)
-                {'range': f'O{row_num}', 'values': [[roc / 100]]},  # ROC (as decimal for % format)
+                {'range': f'J{row_num}', 'values': [[f'${total_fees:.2f}']]},  # Fees
+                {'range': f'L{row_num}', 'values': [[f'${close_net_price:.2f}']]},  # Closing Net Price
+                {'range': f'N{row_num}', 'values': [[f'${total_pnl:.2f}']]},  # Total PnL
+                {'range': f'O{row_num}', 'values': [[f'{roc:.2f}%']]},  # ROC
             ]
 
-            self.sheet.batch_update(updates, value_input_option='USER_ENTERED')
+            self.sheet.batch_update(updates)
+
+            # Highlight updated row with light green background
+            try:
+                self.sheet.format(f'A{row_num}:P{row_num}', {
+                    'backgroundColor': {
+                        'red': 0.85,
+                        'green': 0.95,
+                        'blue': 0.85
+                    }
+                })
+            except:
+                pass  # Ignore formatting errors
 
             print(f"✓ Updated {trade.get('underlying')} {strategy} (row {row_num})")
             return True
@@ -551,13 +546,7 @@ class SpreadsheetLogger:
 
                 # Now append the new position
                 row = self.format_trade_row(trade)
-                self.sheet.append_row(row, value_input_option='USER_ENTERED')
-
-                # Get the row number that was just appended and format it
-                all_rows = self.sheet.get_all_values()
-                new_row_num = len(all_rows)
-                self.format_new_row(new_row_num)
-
+                self.sheet.append_row(row)
                 print(f"✓ Logged ROLL {trade.get('underlying')} {trade.get('new_strategy', '')}")
                 return True
 
@@ -586,12 +575,7 @@ class SpreadsheetLogger:
 
             # For OPEN trades, append new row
             row = self.format_trade_row(trade)
-            self.sheet.append_row(row, value_input_option='USER_ENTERED')
-
-            # Get the row number that was just appended and format it
-            all_rows = self.sheet.get_all_values()
-            new_row_num = len(all_rows)
-            self.format_new_row(new_row_num)
+            self.sheet.append_row(row)
 
             print(f"✓ Logged {action} {trade.get('underlying')} {strategy}")
             return True
@@ -613,9 +597,54 @@ class SpreadsheetLogger:
             row_num: Row number to format (1-indexed)
         """
         try:
-            # Apply RIGHT alignment to all columns to match existing rows
-            self.sheet.format(f'A{row_num}:P{row_num}', {
+            # Column formatting based on spreadsheet structure:
+            # A-B: Dates (center)
+            # C-E: Text/status (center)
+            # F: Expiration (center)
+            # G-H: Strikes (right, currency)
+            # I: Delta (center)
+            # J-L: Money values (right, currency)
+            # M: Contracts (center)
+            # N-O: Money values (right, currency/percent)
+            # P: Notes (left)
+
+            self.sheet.format(f'A{row_num}:B{row_num}', {
+                'horizontalAlignment': 'CENTER',
+                'verticalAlignment': 'MIDDLE'
+            })
+
+            self.sheet.format(f'C{row_num}:F{row_num}', {
+                'horizontalAlignment': 'CENTER',
+                'verticalAlignment': 'MIDDLE'
+            })
+
+            self.sheet.format(f'G{row_num}:H{row_num}', {
                 'horizontalAlignment': 'RIGHT',
+                'verticalAlignment': 'MIDDLE'
+            })
+
+            self.sheet.format(f'I{row_num}', {
+                'horizontalAlignment': 'CENTER',
+                'verticalAlignment': 'MIDDLE'
+            })
+
+            self.sheet.format(f'J{row_num}:L{row_num}', {
+                'horizontalAlignment': 'RIGHT',
+                'verticalAlignment': 'MIDDLE'
+            })
+
+            self.sheet.format(f'M{row_num}', {
+                'horizontalAlignment': 'CENTER',
+                'verticalAlignment': 'MIDDLE'
+            })
+
+            self.sheet.format(f'N{row_num}:O{row_num}', {
+                'horizontalAlignment': 'RIGHT',
+                'verticalAlignment': 'MIDDLE'
+            })
+
+            self.sheet.format(f'P{row_num}', {
+                'horizontalAlignment': 'LEFT',
                 'verticalAlignment': 'MIDDLE'
             })
 
