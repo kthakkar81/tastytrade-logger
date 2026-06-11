@@ -315,8 +315,21 @@ class SpreadsheetLogger:
         Returns:
             Row number (1-indexed) if found, None otherwise
         """
+        matches = self.find_all_open_trades(trade)
+        return matches[0] if matches else None
+
+    def find_all_open_trades(self, trade: Dict) -> List[int]:
+        """
+        Find ALL matching OPEN trade rows in spreadsheet
+
+        Args:
+            trade: CLOSE trade to match
+
+        Returns:
+            List of row numbers (1-indexed), oldest first
+        """
         if not self.sheet:
-            return None
+            return []
 
         try:
             # Get all rows from spreadsheet
@@ -324,7 +337,7 @@ class SpreadsheetLogger:
 
             # Skip header row
             if len(all_rows) <= 1:
-                return None
+                return []
 
             # Extract matching criteria from CLOSE trade
             underlying = trade.get('underlying', '')
@@ -360,8 +373,10 @@ class SpreadsheetLogger:
 
             underlying_normalized = normalize_underlying(underlying)
 
-            # Search from bottom up (most recent trades first)
-            for i in range(len(all_rows) - 1, 0, -1):
+            matching_rows = []
+
+            # Search from top to bottom (oldest first)
+            for i in range(1, len(all_rows)):
                 row = all_rows[i]
 
                 # Skip if not enough columns
@@ -399,15 +414,15 @@ class SpreadsheetLogger:
                     row_expiration_normalized == expiration_normalized and
                     strikes_match):
 
-                    return i + 1  # Return 1-indexed row number
+                    matching_rows.append(i + 1)  # 1-indexed row number
 
-            return None
+            return matching_rows
 
         except Exception as e:
-            print(f"✗ Error finding open trade: {e}")
+            print(f"✗ Error finding open trades: {e}")
             import traceback
             traceback.print_exc()
-            return None
+            return []
 
     def update_close_trade(self, row_num: int, trade: Dict) -> bool:
         """
@@ -537,28 +552,51 @@ class SpreadsheetLogger:
                 print(f"✓ Logged ROLL {trade.get('underlying')} {trade.get('new_strategy', '')}")
                 return True
 
-            # For CLOSE trades, try to find and update existing OPEN row
+            # For CLOSE trades, find and update all matching OPEN rows
             if action == 'CLOSE':
-                row_num = self.find_open_trade(trade)
-                if row_num:
-                    # Verify quantities match before updating
-                    existing_row = self.sheet.row_values(row_num)
-                    existing_qty_str = existing_row[12] if len(existing_row) > 12 and existing_row[12] else '0'
-                    existing_qty = int(float(existing_qty_str))
-                    close_qty = trade.get('quantity', 0)
+                matching_rows = self.find_all_open_trades(trade)
 
-                    if existing_qty == close_qty:
-                        return self.update_close_trade(row_num, trade)
-                    else:
-                        # Quantity mismatch - log to errors instead of updating
-                        self.log_error(trade, f'Quantity mismatch: OPEN={existing_qty}, CLOSE={close_qty}')
-                        print(f"✗ Quantity mismatch for {trade.get('underlying')} {strategy} (OPEN={existing_qty}, CLOSE={close_qty}) - logged to Import Errors")
-                        return False
-                else:
-                    # No matching OPEN found - log to error sheet instead
+                if not matching_rows:
+                    # No matching OPEN found - log to error sheet
                     self.log_error(trade, 'No matching OPEN found')
                     print(f"✗ No matching OPEN for {trade.get('underlying')} {strategy} - logged to Import Errors")
                     return False
+
+                # Calculate total open quantity across all matches
+                total_open_qty = 0
+                row_quantities = []
+                for row_num in matching_rows:
+                    existing_row = self.sheet.row_values(row_num)
+                    existing_qty_str = existing_row[12] if len(existing_row) > 12 and existing_row[12] else '0'
+                    existing_qty = int(float(existing_qty_str))
+                    total_open_qty += existing_qty
+                    row_quantities.append((row_num, existing_qty))
+
+                close_qty = trade.get('quantity', 0)
+
+                # Verify total quantities match
+                if total_open_qty != close_qty:
+                    self.log_error(trade, f'Quantity mismatch: Total OPEN={total_open_qty}, CLOSE={close_qty}')
+                    print(f"✗ Quantity mismatch for {trade.get('underlying')} {strategy} (Total OPEN={total_open_qty}, CLOSE={close_qty}) - logged to Import Errors")
+                    return False
+
+                # Close each matching position with proportional pricing
+                total_net_price = trade.get('net_price', 0)
+                total_fees = trade.get('fees', 0)
+
+                success_count = 0
+                for row_num, row_qty in row_quantities:
+                    # Calculate proportional values for this position
+                    qty_ratio = row_qty / close_qty
+                    proportional_trade = trade.copy()
+                    proportional_trade['quantity'] = row_qty
+                    proportional_trade['net_price'] = total_net_price * qty_ratio
+                    proportional_trade['fees'] = total_fees * qty_ratio
+
+                    if self.update_close_trade(row_num, proportional_trade):
+                        success_count += 1
+
+                return success_count == len(row_quantities)
 
             # For OPEN trades, append new row
             row = self.format_trade_row(trade)
