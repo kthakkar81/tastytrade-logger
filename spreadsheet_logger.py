@@ -67,7 +67,7 @@ class SpreadsheetLogger:
                     # Clear and add proper header
                     self.error_sheet.clear()
                     self.error_sheet.append_row(expected_header)
-            except:
+            except gspread.exceptions.WorksheetNotFound:
                 # Create error sheet if it doesn't exist
                 self.error_sheet = spreadsheet.add_worksheet(title='Import Errors', rows=100, cols=10)
                 # Add header row
@@ -154,7 +154,6 @@ class SpreadsheetLogger:
                 '',                     # Closing Net Price (blank for opens)
                 quantity,               # Contracts (number)
                 '',                     # Total PnL (blank for opens)
-                '',                     # ROC (blank for now)
                 notes                   # Notes/Setup
             ]
 
@@ -194,7 +193,6 @@ class SpreadsheetLogger:
                 net_price,              # Closing Net Price (number)
                 quantity,               # Contracts (number)
                 '',                     # Total PnL (calculate manually)
-                '',                     # ROC
                 notes                   # Notes
             ]
 
@@ -353,12 +351,12 @@ class SpreadsheetLogger:
 
             expiration_normalized = normalize_date(expiration)
 
-            # Normalize underlying symbol (SPXW -> SPX)
+            # Normalize underlying symbol (SPXW -> SPX, RUTW -> RUT)
             def normalize_underlying(symbol):
                 if not symbol:
                     return ''
-                # SPXW is the weekly SPX - treat as equivalent
-                return symbol.replace('SPXW', 'SPX')
+                # SPXW is the weekly SPX, RUTW is the weekly RUT - treat as equivalent
+                return symbol.replace('SPXW', 'SPX').replace('RUTW', 'RUT')
 
             underlying_normalized = normalize_underlying(underlying)
 
@@ -451,27 +449,6 @@ class SpreadsheetLogger:
             # K and L are already total values for all contracts
             total_pnl = open_net_price + close_net_price
 
-            # Calculate ROC (return on capital)
-            # For spreads: capital at risk = width * contracts * 100
-            # For CSP: capital at risk = strike * contracts * 100
-            # ROC = P&L / capital at risk
-            strategy = existing_row[3] if len(existing_row) > 3 else ''
-            short_strike_str = existing_row[6].replace('$', '').replace(',', '') if len(existing_row) > 6 and existing_row[6] else '0'
-            long_strike_str = existing_row[7].replace('$', '').replace(',', '') if len(existing_row) > 7 and existing_row[7] else '0'
-
-            short_strike = float(short_strike_str) if short_strike_str else 0
-            long_strike = float(long_strike_str) if long_strike_str else 0
-
-            if 'Spread' in strategy and short_strike and long_strike:
-                width = abs(short_strike - long_strike)
-                capital_at_risk = width * contracts * 100
-            elif 'CSP' in strategy and short_strike:
-                capital_at_risk = short_strike * contracts * 100
-            else:
-                capital_at_risk = 0
-
-            roc = (total_pnl / capital_at_risk * 100) if capital_at_risk > 0 else 0
-
             # Update cells (1-indexed columns)
             # Parse closing date to datetime object
             closing_date_obj = self._parse_date(closing_date)
@@ -482,12 +459,11 @@ class SpreadsheetLogger:
                 {'range': f'J{row_num}', 'values': [[total_fees]]},  # Fees (number)
                 {'range': f'L{row_num}', 'values': [[close_net_price]]},  # Closing Net Price (number)
                 {'range': f'N{row_num}', 'values': [[total_pnl]]},  # Total PnL (number)
-                {'range': f'O{row_num}', 'values': [[roc / 100]]},  # ROC (as decimal for % format)
             ]
 
             self.sheet.batch_update(updates, value_input_option='USER_ENTERED')
 
-            print(f"✓ Updated {trade.get('underlying')} {strategy} (row {row_num})")
+            print(f"✓ Updated {trade.get('underlying')} {trade.get('strategy', '')} (row {row_num})")
             return True
 
         except Exception as e:
@@ -752,10 +728,9 @@ def test_logger():
 
     print("Testing Spreadsheet Logger...\n")
 
-    # Use test spreadsheet ID from config
-    if not hasattr(config, 'TEST_SPREADSHEET_ID'):
-        print("✗ Missing TEST_SPREADSHEET_ID in config")
-        print("  Please add TEST_SPREADSHEET_ID = '1dykZLMLgXwVU3PXmsu_i_jEHzyPGa-m24Kef8L71R8k' to config.py")
+    # Use trade log spreadsheet ID from config
+    if not hasattr(config, 'TRADE_LOG_SPREADSHEET_ID'):
+        print("✗ Missing TRADE_LOG_SPREADSHEET_ID in config")
         return
 
     # Fetch and process transactions
@@ -763,14 +738,14 @@ def test_logger():
     if not client.authenticate():
         return
 
-    transactions = client.get_transactions(start_date='2026-05-20', end_date='2026-05-20')
+    transactions = client.get_transactions(start_date='2026-06-10', end_date='2026-06-10')
 
     processor = TransactionProcessor()
     processor.load_transactions(transactions)
     trades = processor.process_orders()
 
     # Log to spreadsheet
-    logger = SpreadsheetLogger(config.TEST_SPREADSHEET_ID)
+    logger = SpreadsheetLogger(config.TRADE_LOG_SPREADSHEET_ID)
     if not logger.authenticate():
         return
 
