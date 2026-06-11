@@ -424,6 +424,228 @@ class SpreadsheetLogger:
             traceback.print_exc()
             return []
 
+    def find_existing_open(self, trade: Dict) -> int:
+        """
+        Check if an OPEN trade already exists in the spreadsheet
+
+        Args:
+            trade: OPEN trade to check
+
+        Returns:
+            Row number (1-indexed) if found, None otherwise
+        """
+        if not self.sheet:
+            return None
+
+        try:
+            # Get all rows from spreadsheet
+            all_rows = self.sheet.get_all_values()
+
+            # Skip header row
+            if len(all_rows) <= 1:
+                return None
+
+            # Extract matching criteria from OPEN trade
+            underlying = trade.get('underlying', '')
+            strategy = trade.get('strategy', '')
+            expiration = trade.get('expiration', '')
+            strikes_str = trade.get('strikes', '')
+            strikes = self._parse_strikes(strikes_str, strategy)
+            opening_date = trade.get('trade_date', '')
+            quantity = trade.get('quantity', 0)
+
+            # Normalize functions (same as find_all_open_trades)
+            def normalize_date(date_str):
+                if not date_str:
+                    return ''
+                try:
+                    parts = date_str.split('/')
+                    if len(parts) == 3:
+                        month = str(int(parts[0]))
+                        day = str(int(parts[1]))
+                        year = parts[2]
+                        return f"{month}/{day}/{year}"
+                except:
+                    pass
+                return date_str
+
+            def normalize_underlying(symbol):
+                if not symbol:
+                    return ''
+                return symbol.replace('SPXW', 'SPX').replace('RUTW', 'RUT')
+
+            expiration_normalized = normalize_date(expiration)
+            opening_date_normalized = normalize_date(opening_date)
+            underlying_normalized = normalize_underlying(underlying)
+
+            # Search from bottom up (most recent first)
+            for i in range(len(all_rows) - 1, 0, -1):
+                row = all_rows[i]
+
+                # Skip if not enough columns
+                if len(row) < 13:
+                    continue
+
+                # Column indices: 0=Opening Date, 2=Underlying, 3=Strategy, 4=Status, 5=Expiration, 6=Short Strike, 7=Long Strike, 12=Quantity, 15=Notes
+                row_opening_date = row[0]
+                row_underlying = row[2]
+                row_strategy = row[3]
+                row_status = row[4]
+                row_expiration = row[5]
+                row_short_strike = row[6]
+                row_long_strike = row[7]
+                row_quantity_str = row[12] if len(row) > 12 and row[12] else '0'
+                row_quantity = int(float(row_quantity_str))
+                row_notes = row[15] if len(row) > 15 else ''
+
+                # Normalize for comparison
+                row_expiration_normalized = normalize_date(row_expiration)
+                row_opening_date_normalized = normalize_date(row_opening_date)
+                row_underlying_normalized = normalize_underlying(row_underlying)
+
+                # Match criteria: same underlying, strategy, expiration, strikes, opening date, and quantity
+                strikes_match = False
+                if strategy == 'IC':
+                    if f"Strikes: {strikes_str}" in row_notes:
+                        strikes_match = True
+                else:
+                    strikes_match = (row_short_strike == strikes['short'] and
+                                   row_long_strike == strikes['long'])
+
+                if (row_underlying_normalized == underlying_normalized and
+                    row_strategy == strategy and
+                    row_expiration_normalized == expiration_normalized and
+                    row_opening_date_normalized == opening_date_normalized and
+                    row_quantity == quantity and
+                    strikes_match):
+
+                    return i + 1  # Return 1-indexed row number
+
+            return None
+
+        except Exception as e:
+            print(f"✗ Error checking for existing open: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    def find_existing_closed(self, trade: Dict) -> int:
+        """
+        Check if a CLOSE trade already exists in the spreadsheet
+        Handles cases where close was split across multiple positions
+
+        Args:
+            trade: CLOSE trade to check
+
+        Returns:
+            Row number (1-indexed) of first match if found, None otherwise
+        """
+        if not self.sheet:
+            return None
+
+        try:
+            # Get all rows from spreadsheet
+            all_rows = self.sheet.get_all_values()
+
+            # Skip header row
+            if len(all_rows) <= 1:
+                return None
+
+            # Extract matching criteria from CLOSE trade
+            underlying = trade.get('underlying', '')
+            strategy = trade.get('strategy', '')
+            expiration = trade.get('expiration', '')
+            strikes_str = trade.get('strikes', '')
+            strikes = self._parse_strikes(strikes_str, strategy)
+            closing_date = trade.get('trade_date', '')
+            quantity = trade.get('quantity', 0)
+
+            # Normalize functions
+            def normalize_date(date_str):
+                if not date_str:
+                    return ''
+                try:
+                    parts = date_str.split('/')
+                    if len(parts) == 3:
+                        month = str(int(parts[0]))
+                        day = str(int(parts[1]))
+                        year = parts[2]
+                        return f"{month}/{day}/{year}"
+                except:
+                    pass
+                return date_str
+
+            def normalize_underlying(symbol):
+                if not symbol:
+                    return ''
+                return symbol.replace('SPXW', 'SPX').replace('RUTW', 'RUT')
+
+            expiration_normalized = normalize_date(expiration)
+            closing_date_normalized = normalize_date(closing_date)
+            underlying_normalized = normalize_underlying(underlying)
+
+            # Find all matching closed positions
+            matching_closed = []
+            total_closed_qty = 0
+
+            for i in range(len(all_rows) - 1, 0, -1):
+                row = all_rows[i]
+
+                # Skip if not enough columns
+                if len(row) < 13:
+                    continue
+
+                # Column indices: 1=Closing Date, 2=Underlying, 3=Strategy, 4=Status, 5=Expiration, 6=Short Strike, 7=Long Strike, 12=Quantity, 15=Notes
+                row_closing_date = row[1]
+                row_underlying = row[2]
+                row_strategy = row[3]
+                row_status = row[4]
+                row_expiration = row[5]
+                row_short_strike = row[6]
+                row_long_strike = row[7]
+                row_quantity_str = row[12] if len(row) > 12 and row[12] else '0'
+                row_quantity = int(float(row_quantity_str))
+                row_notes = row[15] if len(row) > 15 else ''
+
+                # Only match Closed positions
+                if row_status != 'Closed':
+                    continue
+
+                # Normalize for comparison
+                row_expiration_normalized = normalize_date(row_expiration)
+                row_closing_date_normalized = normalize_date(row_closing_date)
+                row_underlying_normalized = normalize_underlying(row_underlying)
+
+                # Match criteria: same underlying, strategy, expiration, strikes, and closing date
+                strikes_match = False
+                if strategy == 'IC':
+                    if f"Strikes: {strikes_str}" in row_notes:
+                        strikes_match = True
+                else:
+                    strikes_match = (row_short_strike == strikes['short'] and
+                                   row_long_strike == strikes['long'])
+
+                if (row_underlying_normalized == underlying_normalized and
+                    row_strategy == strategy and
+                    row_expiration_normalized == expiration_normalized and
+                    row_closing_date_normalized == closing_date_normalized and
+                    strikes_match):
+
+                    matching_closed.append(i + 1)
+                    total_closed_qty += row_quantity
+
+            # Return first match if total quantity matches
+            if matching_closed and total_closed_qty == quantity:
+                return matching_closed[0]
+
+            return None
+
+        except Exception as e:
+            print(f"✗ Error checking for existing close: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
     def update_close_trade(self, row_num: int, trade: Dict) -> bool:
         """
         Update existing OPEN row with CLOSE information
@@ -557,7 +779,13 @@ class SpreadsheetLogger:
                 matching_rows = self.find_all_open_trades(trade)
 
                 if not matching_rows:
-                    # No matching OPEN found - log to error sheet
+                    # Check if this position was already closed (to avoid duplicate error logs on re-run)
+                    already_closed = self.find_existing_closed(trade)
+                    if already_closed:
+                        print(f"⊘ Skipped duplicate CLOSE {trade.get('underlying')} {strategy} (already closed at row {already_closed})")
+                        return True  # Return success since it's already closed
+
+                    # No matching OPEN found and not already closed - log to error sheet
                     self.log_error(trade, 'No matching OPEN found')
                     print(f"✗ No matching OPEN for {trade.get('underlying')} {strategy} - logged to Import Errors")
                     return False
@@ -598,7 +826,15 @@ class SpreadsheetLogger:
 
                 return success_count == len(row_quantities)
 
-            # For OPEN trades, append new row
+            # For OPEN trades, check for duplicate before appending
+            if action == 'OPEN':
+                # Check if this OPEN already exists
+                existing_open = self.find_existing_open(trade)
+                if existing_open:
+                    print(f"⊘ Skipped duplicate OPEN {trade.get('underlying')} {strategy} (already at row {existing_open})")
+                    return True  # Return success since it's already logged
+
+            # Append new row
             row = self.format_trade_row(trade)
             self.sheet.append_row(row, value_input_option='USER_ENTERED')
 
