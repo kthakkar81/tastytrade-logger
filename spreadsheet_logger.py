@@ -802,6 +802,26 @@ class SpreadsheetLogger:
 
                 close_qty = trade.get('quantity', 0)
 
+                # Handle partial sale: split OPEN row if only one match and close_qty < total_open_qty
+                if close_qty < total_open_qty and len(matching_rows) == 1:
+                    remaining_qty = total_open_qty - close_qty
+                    print(f"⚙ Partial sale detected: splitting {total_open_qty} contracts into ({close_qty} + {remaining_qty})")
+
+                    # Split the single OPEN row into two
+                    original_row_num = matching_rows[0]
+                    new_rows = self._split_open_row(original_row_num, close_qty, remaining_qty)
+
+                    if new_rows:
+                        # Update matching_rows and row_quantities to point to the matching-qty split
+                        matching_row_num, remaining_row_num = new_rows
+                        matching_rows = [matching_row_num]
+                        row_quantities = [(matching_row_num, close_qty)]
+                        total_open_qty = close_qty  # Update to match
+                        print(f"✓ Split complete: row {matching_row_num} ({close_qty} contracts) + row {remaining_row_num} ({remaining_qty} contracts)")
+                    else:
+                        self.log_error(trade, 'Failed to split OPEN row for partial sale')
+                        return False
+
                 # Verify total quantities match
                 if total_open_qty != close_qty:
                     self.log_error(trade, f'Quantity mismatch: Total OPEN={total_open_qty}, CLOSE={close_qty}')
@@ -872,6 +892,88 @@ class SpreadsheetLogger:
         except Exception as e:
             # Don't fail the whole operation if formatting fails
             pass
+
+    def _split_open_row(self, row_num: int, qty1: int, qty2: int):
+        """
+        Split an OPEN row into two separate rows with different quantities
+        Used for partial sales where only some contracts are closed
+
+        Args:
+            row_num: Original row number to split (1-indexed)
+            qty1: Quantity for first split (will be matched with CLOSE)
+            qty2: Quantity for second split (remains open)
+
+        Returns:
+            Tuple of (matching_row_num, remaining_row_num) or None if failed
+        """
+        try:
+            # Get all rows to avoid padding issues with row_values()
+            all_rows = self.sheet.get_all_values()
+
+            if row_num < 1 or row_num > len(all_rows):
+                print(f"✗ Row {row_num} is out of range (sheet has {len(all_rows)} rows)")
+                return None
+
+            # Get the original row (convert to 0-indexed)
+            original_row = all_rows[row_num - 1].copy()
+
+            if len(original_row) < 13:
+                print(f"✗ Row {row_num} has insufficient columns ({len(original_row)})")
+                return None
+
+            # Trim to only the first 15 columns (the actual data columns we use)
+            original_row = original_row[:15]
+
+            # Pad to 15 columns if needed
+            while len(original_row) < 15:
+                original_row.append('')
+
+            # Get original values
+            original_qty = int(float(original_row[12])) if original_row[12] else 0
+            original_fees_str = original_row[9].replace('$', '').replace(',', '') if original_row[9] else '0'
+            original_fees = float(original_fees_str)
+            original_price_str = original_row[10].replace('$', '').replace(',', '').replace('(', '-').replace(')', '') if original_row[10] else '0'
+            original_price = float(original_price_str)
+
+            # Calculate proportional values
+            ratio1 = qty1 / original_qty if original_qty > 0 else 0
+            ratio2 = qty2 / original_qty if original_qty > 0 else 0
+
+            # Create two copies of the row with adjusted quantities, prices, and fees
+            row1 = original_row.copy()
+            row2 = original_row.copy()
+
+            # Update row1 (qty1 contracts)
+            row1[12] = qty1  # Quantity
+            row1[9] = original_fees * ratio1  # Proportional fees
+            row1[10] = original_price * ratio1  # Proportional opening price
+
+            # Update row2 (qty2 contracts)
+            row2[12] = qty2  # Quantity
+            row2[9] = original_fees * ratio2  # Proportional fees
+            row2[10] = original_price * ratio2  # Proportional opening price
+
+            print(f"  Split: ${original_price:.2f} → ${original_price * ratio1:.2f} + ${original_price * ratio2:.2f}, Fees: ${original_fees:.2f} → ${original_fees * ratio1:.2f} + ${original_fees * ratio2:.2f}")
+
+            # Insert both new rows at the original position
+            # This avoids potential append_row issues
+            self.sheet.insert_row(row1, row_num, value_input_option='USER_ENTERED')
+            self.format_new_row(row_num)
+
+            self.sheet.insert_row(row2, row_num + 1, value_input_option='USER_ENTERED')
+            self.format_new_row(row_num + 1)
+
+            # Delete the original row (now pushed down by 2)
+            self.sheet.delete_rows(row_num + 2)
+
+            # The new rows are at the original position
+            return (row_num, row_num + 1)
+
+        except Exception as e:
+            print(f"✗ Failed to split row {row_num}: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
     def log_error(self, trade: Dict, error_msg: str):
         """
