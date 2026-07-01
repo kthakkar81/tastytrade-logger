@@ -5,12 +5,15 @@ from tastytrade_client import TastytradeClient
 from transaction_processor import TransactionProcessor
 from spreadsheet_logger import SpreadsheetLogger
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import config
 
 
 def main():
     """Run sync for today on production sheet"""
-    today = datetime.now().strftime('%Y-%m-%d')
+    # Use Pacific timezone explicitly (cloud agents run in UTC)
+    pacific_tz = ZoneInfo('America/Los_Angeles')
+    today = datetime.now(pacific_tz).strftime('%Y-%m-%d')
 
     print("=" * 60)
     print(f"TASTYTRADE LOGGER - PRODUCTION SYNC for {today}")
