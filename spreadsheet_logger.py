@@ -764,14 +764,14 @@ class SpreadsheetLogger:
 
                 # Now append the new position
                 row = self.format_trade_row(trade)
-                self.sheet.append_row(row, value_input_option='USER_ENTERED')
-
-                # Get the row number that was just appended and format it
-                all_rows = self.sheet.get_all_values()
-                new_row_num = len(all_rows)
+                new_row_num = self._append_row_at_column_a(row)
                 self.format_new_row(new_row_num)
 
                 print(f"✓ Logged ROLL {trade.get('underlying')} {trade.get('new_strategy', '')}")
+
+                # Clear any associated import errors
+                self.clear_error(trade)
+
                 return True
 
             # For CLOSE trades, find and update all matching OPEN rows
@@ -783,6 +783,8 @@ class SpreadsheetLogger:
                     already_closed = self.find_existing_closed(trade)
                     if already_closed:
                         print(f"⊘ Skipped duplicate CLOSE {trade.get('underlying')} {strategy} (already closed at row {already_closed})")
+                        # Clear any associated import errors since the trade is already successfully logged
+                        self.clear_error(trade)
                         return True  # Return success since it's already closed
 
                     # No matching OPEN found and not already closed - log to error sheet
@@ -844,6 +846,10 @@ class SpreadsheetLogger:
                     if self.update_close_trade(row_num, proportional_trade):
                         success_count += 1
 
+                # Clear any associated import errors if all closes succeeded
+                if success_count == len(row_quantities):
+                    self.clear_error(trade)
+
                 return success_count == len(row_quantities)
 
             # For OPEN trades, check for duplicate before appending
@@ -852,18 +858,20 @@ class SpreadsheetLogger:
                 existing_open = self.find_existing_open(trade)
                 if existing_open:
                     print(f"⊘ Skipped duplicate OPEN {trade.get('underlying')} {strategy} (already at row {existing_open})")
+                    # Clear any associated import errors since the trade is already successfully logged
+                    self.clear_error(trade)
                     return True  # Return success since it's already logged
 
             # Append new row
             row = self.format_trade_row(trade)
-            self.sheet.append_row(row, value_input_option='USER_ENTERED')
-
-            # Get the row number that was just appended and format it
-            all_rows = self.sheet.get_all_values()
-            new_row_num = len(all_rows)
+            new_row_num = self._append_row_at_column_a(row)
             self.format_new_row(new_row_num)
 
             print(f"✓ Logged {action} {trade.get('underlying')} {strategy}")
+
+            # Clear any associated import errors
+            self.clear_error(trade)
+
             return True
 
         except Exception as e:
@@ -874,6 +882,37 @@ class SpreadsheetLogger:
             import traceback
             traceback.print_exc()
             return False
+
+    def _append_row_at_column_a(self, row: List[str]) -> int:
+        """
+        Append a row starting at column A (not at the end of the widest row)
+
+        Args:
+            row: List of cell values to append
+
+        Returns:
+            Row number where the data was written (1-indexed)
+        """
+        # Find the last row with data in column A
+        all_rows = self.sheet.get_all_values()
+        last_data_row = 0
+        for i in range(len(all_rows) - 1, -1, -1):
+            if i < len(all_rows) and len(all_rows[i]) > 0 and all_rows[i][0].strip():
+                last_data_row = i + 1
+                break
+
+        # Write to the next row
+        target_row = last_data_row + 1
+
+        # Calculate the range (columns A to O for 15 columns, or P for 16)
+        num_cols = len(row)
+        end_col = chr(ord('A') + num_cols - 1)  # A=0, B=1, ..., O=14, P=15
+        range_name = f'A{target_row}:{end_col}{target_row}'
+
+        # Use update with explicit range
+        self.sheet.update(values=[row], range_name=range_name, value_input_option='USER_ENTERED')
+
+        return target_row
 
     def format_new_row(self, row_num: int):
         """
@@ -1001,6 +1040,87 @@ class SpreadsheetLogger:
             self.error_sheet.append_row(error_row)
         except Exception as e:
             print(f"⚠ Failed to log error: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def clear_error(self, trade: Dict):
+        """
+        Clear any matching errors from Import Errors sheet after successful processing
+
+        Args:
+            trade: Trade that was successfully processed
+        """
+        if not self.error_sheet:
+            return
+
+        try:
+            # Get all error rows
+            all_errors = self.error_sheet.get_all_values()
+
+            # Skip header row
+            if len(all_errors) <= 1:
+                return
+
+            # Normalize functions (same as find_all_open_trades)
+            def normalize_date(date_str):
+                if not date_str:
+                    return ''
+                try:
+                    parts = date_str.split('/')
+                    if len(parts) == 3:
+                        month = str(int(parts[0]))
+                        day = str(int(parts[1]))
+                        year = parts[2]
+                        return f"{month}/{day}/{year}"
+                except:
+                    pass
+                return date_str
+
+            def normalize_underlying(symbol):
+                if not symbol:
+                    return ''
+                return symbol.replace('SPXW', 'SPX').replace('RUTW', 'RUT')
+
+            # Extract trade details for matching
+            underlying = normalize_underlying(trade.get('underlying', ''))
+            strategy = trade.get('strategy', trade.get('new_strategy', ''))
+            expiration = normalize_date(trade.get('expiration', ''))
+            strikes = trade.get('strikes', trade.get('new_strikes', ''))
+            action = trade.get('action', '')
+
+            # Find matching error rows (search from bottom up to avoid index shifts during deletion)
+            rows_to_delete = []
+            for i in range(len(all_errors) - 1, 0, -1):
+                error_row = all_errors[i]
+
+                # Skip if not enough columns
+                if len(error_row) < 6:
+                    continue
+
+                # Column indices: 1=Underlying, 2=Strategy, 3=Expiration, 4=Strikes, 5=Action
+                error_underlying = normalize_underlying(error_row[1])
+                error_strategy = error_row[2]
+                error_expiration = normalize_date(error_row[3])
+                error_strikes = error_row[4]
+                error_action = error_row[5]
+
+                # Match on underlying, strategy, expiration, strikes, and action
+                if (error_underlying == underlying and
+                    error_strategy == strategy and
+                    error_expiration == expiration and
+                    error_strikes == strikes and
+                    error_action == action):
+
+                    rows_to_delete.append(i + 1)  # 1-indexed row number
+
+            # Delete matching rows
+            for row_num in rows_to_delete:
+                self.error_sheet.delete_rows(row_num)
+                print(f"  ✓ Cleared error for {underlying} {strategy} from Import Errors (row {row_num})")
+
+        except Exception as e:
+            # Don't fail the whole operation if clearing errors fails
+            print(f"⚠ Failed to clear error: {e}")
             import traceback
             traceback.print_exc()
 
