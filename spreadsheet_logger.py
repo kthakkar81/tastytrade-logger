@@ -4,6 +4,7 @@ Writes processed trades to Google Sheets trading log
 """
 from typing import List, Dict
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import gspread
 from google.oauth2.service_account import Credentials
 import config
@@ -21,6 +22,7 @@ class SpreadsheetLogger:
         """
         self.spreadsheet_id = spreadsheet_id
         self.client = None
+        self.spreadsheet = None
         self.sheet = None
         self.error_sheet = None
 
@@ -52,6 +54,7 @@ class SpreadsheetLogger:
             # Authorize and open spreadsheet
             self.client = gspread.authorize(creds)
             spreadsheet = self.client.open_by_key(self.spreadsheet_id)
+            self.spreadsheet = spreadsheet
 
             # Get first sheet (or specify sheet name if needed)
             self.sheet = spreadsheet.sheet1
@@ -1182,6 +1185,51 @@ class SpreadsheetLogger:
 
         # Return all trades with aggregated closes
         return other_trades + aggregated_closes
+
+    def log_run(self, status: str, date_range: str = '',
+                trades_logged=0, details: str = '') -> bool:
+        """
+        Append a heartbeat row to the 'Sync Log' worksheet so every run
+        records itself, regardless of whether push notifications work.
+
+        Args:
+            status: 'OK' or 'FAILED'
+            date_range: Date window that was synced (e.g. '2026-07-02..2026-07-06')
+            trades_logged: Number of trades written this run
+            details: Free-text summary / error message
+
+        Returns:
+            bool: True if the run-log row was written
+        """
+        SYNC_LOG_HEADER = ['Timestamp (PT)', 'Date Range', 'Status',
+                           'Trades Logged', 'Details']
+        try:
+            if not self.spreadsheet:
+                print("⚠ Cannot write Sync Log: spreadsheet not authenticated")
+                return False
+
+            # Get or create the Sync Log worksheet
+            try:
+                log_sheet = self.spreadsheet.worksheet('Sync Log')
+                if log_sheet.row_values(1) != SYNC_LOG_HEADER:
+                    log_sheet.clear()
+                    log_sheet.append_row(SYNC_LOG_HEADER)
+            except gspread.exceptions.WorksheetNotFound:
+                log_sheet = self.spreadsheet.add_worksheet(
+                    title='Sync Log', rows=1000, cols=5)
+                log_sheet.append_row(SYNC_LOG_HEADER)
+
+            timestamp = datetime.now(ZoneInfo('America/Los_Angeles')).strftime(
+                '%Y-%m-%d %H:%M:%S')
+            log_sheet.append_row(
+                [timestamp, date_range, status, str(trades_logged), details],
+                value_input_option='USER_ENTERED')
+            print(f"✓ Sync Log updated: {status} ({date_range})")
+            return True
+
+        except Exception as e:
+            print(f"⚠ Failed to write Sync Log: {e}")
+            return False
 
     def append_trades(self, trades: List[Dict]) -> int:
         """
