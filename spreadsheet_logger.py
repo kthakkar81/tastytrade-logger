@@ -738,6 +738,25 @@ class SpreadsheetLogger:
 
             # For ROLL trades, first close the old position, then open new one
             if action == 'ROLL':
+                # If the new leg is already logged, this roll was handled on an
+                # earlier run inside the lookback window. Re-running must not
+                # re-append it, and must not re-report the old position as
+                # missing — it is missing precisely because we already closed it.
+                new_position = {
+                    'underlying': trade.get('underlying'),
+                    'strategy': trade.get('new_strategy', ''),
+                    'expiration': trade.get('new_expiration', ''),
+                    'strikes': trade.get('new_strikes', ''),
+                    'quantity': trade.get('quantity', 0),
+                    'trade_date': trade.get('trade_date', '')
+                }
+                existing_roll = self.find_existing_open(new_position)
+                if existing_roll:
+                    print(f"⊘ Skipped duplicate ROLL {trade.get('underlying')} "
+                          f"{trade.get('new_strategy', '')} (already at row {existing_roll})")
+                    self.clear_error(trade)
+                    return True
+
                 # Create a pseudo-CLOSE trade for the old position
                 old_position = {
                     'underlying': trade.get('underlying'),
@@ -1030,12 +1049,15 @@ class SpreadsheetLogger:
 
         try:
             from datetime import datetime
+            # ROLL trades carry new_*/old_* keys rather than the flat ones, so
+            # fall back to the new leg. clear_error() resolves these fields the
+            # same way — if the two disagree, an error can never be cleared.
             error_row = [
                 datetime.now().strftime('%Y-%m-%d %H:%M:%S'),  # Timestamp
                 trade.get('underlying', ''),
-                trade.get('strategy', ''),
-                trade.get('expiration', ''),
-                trade.get('strikes', ''),
+                trade.get('strategy') or trade.get('new_strategy', ''),
+                trade.get('expiration') or trade.get('new_expiration', ''),
+                trade.get('strikes') or trade.get('new_strikes', ''),
                 trade.get('action', ''),
                 error_msg,
                 f"Date: {trade.get('trade_date', '')}, Qty: {trade.get('quantity', '')}"
@@ -1084,11 +1106,13 @@ class SpreadsheetLogger:
                     return ''
                 return symbol.replace('SPXW', 'SPX').replace('RUTW', 'RUT')
 
-            # Extract trade details for matching
+            # Extract trade details for matching (must resolve fields exactly
+            # as log_error() writes them, including the ROLL new_* fallbacks)
             underlying = normalize_underlying(trade.get('underlying', ''))
-            strategy = trade.get('strategy', trade.get('new_strategy', ''))
-            expiration = normalize_date(trade.get('expiration', ''))
-            strikes = trade.get('strikes', trade.get('new_strikes', ''))
+            strategy = trade.get('strategy') or trade.get('new_strategy', '')
+            expiration = normalize_date(
+                trade.get('expiration') or trade.get('new_expiration', ''))
+            strikes = trade.get('strikes') or trade.get('new_strikes', '')
             action = trade.get('action', '')
 
             # Find matching error rows (search from bottom up to avoid index shifts during deletion)
