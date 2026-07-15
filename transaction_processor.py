@@ -394,9 +394,9 @@ class TransactionProcessor:
             elif 'C' in symbol and 'SELL' in action:
                 return 'Covered Call'
             elif 'P' in symbol and 'BUY' in action:
-                return 'Long Put'
+                return 'Put'
             elif 'C' in symbol and 'BUY' in action:
-                return 'Long Call'
+                return 'Call'
 
         elif num_legs == 2:
             # Check if both are same type (puts or calls)
@@ -491,11 +491,11 @@ class TransactionProcessor:
                 # Buy to Close a Call = originally Sell to Open (Covered Call)
                 return 'Covered Call'
             elif 'P' in symbol and 'SELL' in action and 'CLOSE' in action:
-                # Sell to Close a Put = originally Buy to Open (Long Put)
-                return 'Long Put'
+                # Sell to Close a Put = originally Buy to Open (long Put)
+                return 'Put'
             elif 'C' in symbol and 'SELL' in action and 'CLOSE' in action:
-                # Sell to Close a Call = originally Buy to Open (Long Call)
-                return 'Long Call'
+                # Sell to Close a Call = originally Buy to Open (long Call)
+                return 'Call'
 
         elif num_legs == 2:
             # Check if both are same type (puts or calls)

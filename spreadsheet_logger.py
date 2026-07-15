@@ -712,6 +712,76 @@ class SpreadsheetLogger:
             traceback.print_exc()
             return False
 
+    def _close_matching_open_rows(self, close_trade: Dict):
+        """
+        Close a (pseudo-)CLOSE trade across EVERY matching OPEN row.
+
+        A position opened in several transactions occupies several OPEN rows
+        (same underlying/strategy/strikes/expiration). A single close — whether
+        a plain CLOSE or the close side of a ROLL — can span all of them, so we
+        match them all and allocate net price and fees proportionally by
+        contract count. If one OPEN row holds more contracts than are being
+        closed, it is split first so the untouched remainder stays open.
+
+        Returns a (status, detail) tuple:
+          ('no_match', None)              - no OPEN row matched
+          ('split_failed', None)          - partial close but the row split failed
+          ('qty_mismatch', total_open)    - matched OPEN qty != close qty
+          ('closed', (n_success, n_rows)) - closed n_success of n_rows matches
+        """
+        matching_rows = self.find_all_open_trades(close_trade)
+        if not matching_rows:
+            return ('no_match', None)
+
+        # Calculate total open quantity across all matches
+        total_open_qty = 0
+        row_quantities = []
+        for row_num in matching_rows:
+            existing_row = self.sheet.row_values(row_num)
+            existing_qty_str = existing_row[12] if len(existing_row) > 12 and existing_row[12] else '0'
+            existing_qty = int(float(existing_qty_str))
+            total_open_qty += existing_qty
+            row_quantities.append((row_num, existing_qty))
+
+        close_qty = close_trade.get('quantity', 0)
+
+        # Handle partial close: split OPEN row if only one match and close_qty < total_open_qty
+        if close_qty < total_open_qty and len(matching_rows) == 1:
+            remaining_qty = total_open_qty - close_qty
+            print(f"⚙ Partial sale detected: splitting {total_open_qty} contracts into ({close_qty} + {remaining_qty})")
+
+            original_row_num = matching_rows[0]
+            new_rows = self._split_open_row(original_row_num, close_qty, remaining_qty)
+
+            if new_rows:
+                matching_row_num, remaining_row_num = new_rows
+                row_quantities = [(matching_row_num, close_qty)]
+                total_open_qty = close_qty
+                print(f"✓ Split complete: row {matching_row_num} ({close_qty} contracts) + row {remaining_row_num} ({remaining_qty} contracts)")
+            else:
+                return ('split_failed', None)
+
+        # Verify total quantities match
+        if total_open_qty != close_qty:
+            return ('qty_mismatch', total_open_qty)
+
+        # Close each matching position with proportionally allocated price/fees
+        total_net_price = close_trade.get('net_price', 0)
+        total_fees = close_trade.get('fees', 0)
+
+        success_count = 0
+        for row_num, row_qty in row_quantities:
+            qty_ratio = row_qty / close_qty
+            proportional_trade = close_trade.copy()
+            proportional_trade['quantity'] = row_qty
+            proportional_trade['net_price'] = total_net_price * qty_ratio
+            proportional_trade['fees'] = total_fees * qty_ratio
+
+            if self.update_close_trade(row_num, proportional_trade):
+                success_count += 1
+
+        return ('closed', (success_count, len(row_quantities)))
+
     def append_trade(self, trade: Dict) -> bool:
         """
         Append a single trade to the spreadsheet, or update existing OPEN row if CLOSE
@@ -769,20 +839,32 @@ class SpreadsheetLogger:
                     'fees': trade.get('fees', 0) / 2  # Split fees between close and open
                 }
 
-                # Try to find and close the old position
-                row_num = self.find_open_trade(old_position)
-                if row_num:
-                    # Close the old position
-                    if not self.update_close_trade(row_num, old_position):
-                        self.log_error(trade, 'Failed to close old position in ROLL')
-                        print(f"✗ Failed to close old position for ROLL {trade.get('underlying')} - logged to Import Errors")
-                        return False
-                else:
+                # Close the old position across ALL matching OPEN rows. The old
+                # position may have been opened in multiple transactions and thus
+                # span multiple rows; the roll closes all of them, allocating the
+                # close price/fees proportionally by contract count.
+                status, detail = self._close_matching_open_rows(old_position)
+                if status == 'no_match':
                     # No matching old position found - log error but still open new position
                     error_msg = f"ROLL: No matching OPEN found for old position (exp: {trade.get('old_expiration')}, strikes: {trade.get('old_strikes')})"
                     self.log_error(trade, error_msg)
                     print(f"✗ {error_msg}")
                     # Don't return False - still append the new position
+                elif status == 'split_failed':
+                    self.log_error(trade, 'ROLL: Failed to split OPEN row when closing old position')
+                    print(f"✗ Failed to close old position for ROLL {trade.get('underlying')} - logged to Import Errors")
+                    return False
+                elif status == 'qty_mismatch':
+                    total_open_qty = detail
+                    self.log_error(trade, f"ROLL: Quantity mismatch closing old position (Total OPEN={total_open_qty}, CLOSE={old_position.get('quantity', 0)})")
+                    print(f"✗ Quantity mismatch closing old position for ROLL {trade.get('underlying')} (Total OPEN={total_open_qty}, CLOSE={old_position.get('quantity', 0)}) - logged to Import Errors")
+                    return False
+                elif status == 'closed':
+                    success_count, n_rows = detail
+                    if success_count != n_rows:
+                        self.log_error(trade, 'Failed to close old position in ROLL')
+                        print(f"✗ Failed to close old position for ROLL {trade.get('underlying')} - logged to Import Errors")
+                        return False
 
                 # Now append the new position
                 row = self.format_trade_row(trade)
@@ -798,9 +880,10 @@ class SpreadsheetLogger:
 
             # For CLOSE trades, find and update all matching OPEN rows
             if action == 'CLOSE':
-                matching_rows = self.find_all_open_trades(trade)
+                close_qty = trade.get('quantity', 0)
+                status, detail = self._close_matching_open_rows(trade)
 
-                if not matching_rows:
+                if status == 'no_match':
                     # Check if this position was already closed (to avoid duplicate error logs on re-run)
                     already_closed = self.find_existing_closed(trade)
                     if already_closed:
@@ -814,65 +897,23 @@ class SpreadsheetLogger:
                     print(f"✗ No matching OPEN for {trade.get('underlying')} {strategy} - logged to Import Errors")
                     return False
 
-                # Calculate total open quantity across all matches
-                total_open_qty = 0
-                row_quantities = []
-                for row_num in matching_rows:
-                    existing_row = self.sheet.row_values(row_num)
-                    existing_qty_str = existing_row[12] if len(existing_row) > 12 and existing_row[12] else '0'
-                    existing_qty = int(float(existing_qty_str))
-                    total_open_qty += existing_qty
-                    row_quantities.append((row_num, existing_qty))
+                if status == 'split_failed':
+                    self.log_error(trade, 'Failed to split OPEN row for partial sale')
+                    return False
 
-                close_qty = trade.get('quantity', 0)
-
-                # Handle partial sale: split OPEN row if only one match and close_qty < total_open_qty
-                if close_qty < total_open_qty and len(matching_rows) == 1:
-                    remaining_qty = total_open_qty - close_qty
-                    print(f"⚙ Partial sale detected: splitting {total_open_qty} contracts into ({close_qty} + {remaining_qty})")
-
-                    # Split the single OPEN row into two
-                    original_row_num = matching_rows[0]
-                    new_rows = self._split_open_row(original_row_num, close_qty, remaining_qty)
-
-                    if new_rows:
-                        # Update matching_rows and row_quantities to point to the matching-qty split
-                        matching_row_num, remaining_row_num = new_rows
-                        matching_rows = [matching_row_num]
-                        row_quantities = [(matching_row_num, close_qty)]
-                        total_open_qty = close_qty  # Update to match
-                        print(f"✓ Split complete: row {matching_row_num} ({close_qty} contracts) + row {remaining_row_num} ({remaining_qty} contracts)")
-                    else:
-                        self.log_error(trade, 'Failed to split OPEN row for partial sale')
-                        return False
-
-                # Verify total quantities match
-                if total_open_qty != close_qty:
+                if status == 'qty_mismatch':
+                    total_open_qty = detail
                     self.log_error(trade, f'Quantity mismatch: Total OPEN={total_open_qty}, CLOSE={close_qty}')
                     print(f"✗ Quantity mismatch for {trade.get('underlying')} {strategy} (Total OPEN={total_open_qty}, CLOSE={close_qty}) - logged to Import Errors")
                     return False
 
-                # Close each matching position with proportional pricing
-                total_net_price = trade.get('net_price', 0)
-                total_fees = trade.get('fees', 0)
-
-                success_count = 0
-                for row_num, row_qty in row_quantities:
-                    # Calculate proportional values for this position
-                    qty_ratio = row_qty / close_qty
-                    proportional_trade = trade.copy()
-                    proportional_trade['quantity'] = row_qty
-                    proportional_trade['net_price'] = total_net_price * qty_ratio
-                    proportional_trade['fees'] = total_fees * qty_ratio
-
-                    if self.update_close_trade(row_num, proportional_trade):
-                        success_count += 1
-
+                # status == 'closed'
+                success_count, n_rows = detail
                 # Clear any associated import errors if all closes succeeded
-                if success_count == len(row_quantities):
+                if success_count == n_rows:
                     self.clear_error(trade)
 
-                return success_count == len(row_quantities)
+                return success_count == n_rows
 
             # For OPEN trades, check for duplicate before appending
             if action == 'OPEN':
