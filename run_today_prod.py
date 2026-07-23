@@ -15,12 +15,17 @@ from tastytrade_client import TastytradeClient
 from transaction_processor import TransactionProcessor
 from spreadsheet_logger import SpreadsheetLogger
 from datetime import datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 import config
 
 # How many calendar days back to sync on every run. A delayed catch-up run
 # uses this window to backfill any days missed while the Mac was down.
 LOOKBACK_DAYS = 5
+
+# Touched once this run has written its own Sync Log row; run_sync.sh reads it
+# to decide whether a failure needs a crash row written on the job's behalf.
+HEARTBEAT_MARKER = Path.home() / 'Library/Logs/tastytrade-logger/.self-reported'
 
 
 def main():
@@ -49,6 +54,13 @@ def main():
     def record(status, count=0, details=''):
         logger.log_run(status, date_range=date_range,
                        trades_logged=count, details=details)
+        # Tell run_sync.sh this run reported itself, so it doesn't also write a
+        # crash row. Its absence is how the wrapper detects a run that died
+        # before getting here.
+        try:
+            HEARTBEAT_MARKER.touch()
+        except OSError:
+            pass
 
     try:
         # 1. Fetch transactions across the lookback window

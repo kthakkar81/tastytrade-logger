@@ -55,12 +55,23 @@ You should see:
 python main.py
 ```
 
-### Daily Auto-Run
+### Scheduled Auto-Run
+
+Runs via launchd (`~/Library/LaunchAgents/com.kevin.tastytrade-logger.plist`) at
+14:03, 18:03 and 21:03 PT, Monday–Friday. The entry point is `run_sync.sh`,
+which wraps `run_today_prod.py` and reports crashes the job can't report itself.
 
 ```bash
-# Add to crontab
-0 7 * * * cd /Users/Kevin/Documents/claude/tastytrade-logger && python main.py
+launchctl print gui/$(id -u)/com.kevin.tastytrade-logger   # status
+launchctl kickstart -p gui/$(id -u)/com.kevin.tastytrade-logger  # run now
+tail -f ~/Library/Logs/tastytrade-logger/{out,err}.log     # logs
 ```
+
+**This repo must stay outside `~/Documents` and `~/Desktop`.** Those are
+iCloud-synced, and under disk pressure macOS evicts files there to cloud stubs
+that a background launchd job cannot materialize — reads fail with `EDEADLK`
+and the sync dies at import. That caused silent outages on 2026-07-16 and
+2026-07-23; `run_sync.sh` now refuses to run from such a path.
 
 ## Google Sheets Structure
 
