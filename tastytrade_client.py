@@ -8,6 +8,14 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 import config
 
+# Per-request (connect, read) timeout in seconds for every HTTP call. Without
+# this, a stalled connection makes requests block forever: on 2026-07-23 a run
+# hung mid-fetch with no timeout and never exited, which (because launchd won't
+# start a second instance while one is alive) silently suppressed every
+# scheduled run for the next ~2 days. A finite read timeout turns that hang into
+# a normal exception the wrapper can catch and report.
+REQUEST_TIMEOUT = (10, 30)
+
 
 class TastytradeClient:
     """Client for interacting with Tastytrade API using OAuth 2.0"""
@@ -61,7 +69,8 @@ class TastytradeClient:
                 'Accept': 'application/json'
             }
 
-            response = self.session.post(url, json=payload, headers=headers)
+            response = self.session.post(url, json=payload, headers=headers,
+                                         timeout=REQUEST_TIMEOUT)
 
             if response.status_code in [200, 201]:
                 data = response.json()
@@ -144,7 +153,8 @@ class TastytradeClient:
             all_transactions = []
 
             while True:
-                response = self.session.get(url, params=params)
+                response = self.session.get(url, params=params,
+                                            timeout=REQUEST_TIMEOUT)
                 response.raise_for_status()
 
                 data = response.json()
@@ -184,7 +194,7 @@ class TastytradeClient:
 
         try:
             url = f"{self.api_url}/accounts/{self.account_number}/positions"
-            response = self.session.get(url)
+            response = self.session.get(url, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
 
             data = response.json()
@@ -213,7 +223,7 @@ class TastytradeClient:
 
         try:
             url = f"{self.api_url}/accounts/{self.account_number}/balances"
-            response = self.session.get(url)
+            response = self.session.get(url, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
 
             data = response.json()
@@ -243,7 +253,7 @@ class TastytradeClient:
 
         try:
             url = f"{self.api_url}/customers/me/accounts"
-            response = self.session.get(url)
+            response = self.session.get(url, timeout=REQUEST_TIMEOUT)
             response.raise_for_status()
 
             data = response.json()

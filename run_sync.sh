@@ -28,6 +28,37 @@ CRASH_LOG="${LOG_DIR}/last-crash.log"
 # both exit 1.
 HEARTBEAT_MARKER="${LOG_DIR}/.self-reported"
 
+# Hard wall-clock cap on the sync (seconds). If it ever hangs — e.g. a network
+# read with no timeout — kill it so launchd is free to start the next scheduled
+# run. On 2026-07-23 a single run hung mid-fetch and never exited; because
+# launchd will not launch a second copy of a job while one is still alive, that
+# one hang silently suppressed ~2 days of scheduled runs. A normal full run
+# finishes in well under a minute.
+MAX_RUNTIME=600
+
+# Run "$@" but SIGTERM (then SIGKILL) it if it outlives $1 seconds. launchd's
+# minimal PATH has no GNU `timeout`, so we roll our own with a watchdog subshell.
+run_with_timeout() {
+  local limit=$1; shift
+  "$@" &
+  local cmd_pid=$!
+  (
+    sleep "$limit"
+    print -r -- "✗ Sync exceeded ${limit}s wall-clock limit — killing (hang guard)." \
+      >> "${LOG_DIR}/err.log"
+    kill -TERM "$cmd_pid" 2>/dev/null
+    sleep 10
+    kill -KILL "$cmd_pid" 2>/dev/null
+  ) &
+  local watch_pid=$!
+  wait "$cmd_pid"
+  local rc=$?
+  # Sync finished on its own — cancel the watchdog so it doesn't linger.
+  kill "$watch_pid" 2>/dev/null
+  wait "$watch_pid" 2>/dev/null
+  return $rc
+}
+
 mkdir -p "$LOG_DIR"
 rm -f "$HEARTBEAT_MARKER"
 cd "$REPO_DIR" || exit 78
@@ -53,7 +84,7 @@ for f in run_today_prod.py config.py tastytrade_client.py \
   fi
 done
 
-"$PYTHON" "${REPO_DIR}/run_today_prod.py"
+run_with_timeout "$MAX_RUNTIME" "$PYTHON" "${REPO_DIR}/run_today_prod.py"
 # NB: not `status` — that name is a read-only special variable in zsh (an alias
 # for $?), and assigning to it aborts the script.
 sync_status=$?

@@ -17,7 +17,16 @@ from spreadsheet_logger import SpreadsheetLogger
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
+import socket
 import config
+
+# Global fallback socket timeout (seconds). The Google Sheets client
+# (google-api-python-client / httplib2) doesn't take a per-call timeout the way
+# requests does, so without this a stalled Google connection blocks forever —
+# exactly the CLOSE_WAIT hang that silently froze the scheduled job on
+# 2026-07-23. This bounds every socket that doesn't set its own timeout; the
+# Tastytrade client sets tighter per-request timeouts on top of this.
+socket.setdefaulttimeout(90)
 
 # How many calendar days back to sync on every run. A delayed catch-up run
 # uses this window to backfill any days missed while the Mac was down.
