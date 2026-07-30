@@ -28,13 +28,22 @@ class TransactionProcessor:
     def _group_by_order(self):
         """Group transactions by order ID and consolidate multiple fills"""
         for txn in self.transactions:
-            # Only process Trade type transactions
-            if txn.get('transaction-type') != 'Trade':
+            txn_type = txn.get('transaction-type')
+
+            if txn_type == 'Trade':
+                order_id = txn.get('order-id')
+                if order_id:
+                    self.grouped_orders[order_id].append(txn)
                 continue
 
-            order_id = txn.get('order-id')
-            if order_id:
-                self.grouped_orders[order_id].append(txn)
+            # Option assignment/exercise delivers or removes shares. These are
+            # 'Receive Deliver' records with no order-id, so key them by
+            # transaction id — stable across re-runs, one trade per record.
+            if (txn_type == 'Receive Deliver'
+                    and txn.get('instrument-type') == 'Equity'
+                    and txn.get('transaction-sub-type')
+                    in config.EQUITY_RECEIVE_DELIVER_SUBTYPES):
+                self.grouped_orders[f"RD-{txn.get('id')}"].append(txn)
 
         # Consolidate multiple fills of the same leg within each order
         for order_id in self.grouped_orders:
@@ -105,6 +114,13 @@ class TransactionProcessor:
         if not legs:
             return None
 
+        # Equity orders have no strikes or expiration and belong in the Stock
+        # Log, not the Options Log. Route them out before strategy
+        # classification, which reads P/C out of the symbol and would mangle a
+        # bare ticker (NVDA -> Unknown; a ticker containing P or C -> worse).
+        if all(leg.get('instrument-type') == 'Equity' for leg in legs):
+            return self._process_stock_order(order_id, legs)
+
         # Separate opening and closing legs
         opening_legs = [leg for leg in legs if self._is_opening_action(leg)]
         closing_legs = [leg for leg in legs if self._is_closing_action(leg)]
@@ -162,6 +178,95 @@ class TransactionProcessor:
             'fees': self._calculate_fees(legs),
             'notes': ''
         }
+
+    def _process_stock_order(self, order_id: str, legs: List[Dict]) -> Optional[Dict]:
+        """
+        Process an equity (share) order into a Stock Log trade
+
+        Long-only: 'Buy to Open' opens a lot, 'Sell to Close' closes lots FIFO.
+        Short-side actions are flagged rather than guessed at, because the
+        Stock Log's P/L formula =(Exit-Entry)*Qty assumes a long position.
+
+        Args:
+            order_id: Order identifier (or 'RD-<txn id>' for assignment/exercise)
+            legs: Equity transaction legs for this order
+
+        Returns:
+            Stock trade dictionary, or None if it carries no share quantity
+        """
+        action = legs[0].get('action', '').upper()
+        quantity = self._get_stock_quantity(legs)
+
+        if not quantity:
+            return None
+
+        if self._is_opening_action(legs[0]):
+            trade_action = 'OPEN'
+        elif self._is_closing_action(legs[0]):
+            trade_action = 'CLOSE'
+        else:
+            trade_action = 'UNKNOWN'
+
+        # Short stock is out of scope (see docstring)
+        unsupported = ''
+        if 'SELL' in action and trade_action == 'OPEN':
+            unsupported = 'Short stock (Sell to Open equity) is not supported'
+        elif 'BUY' in action and trade_action == 'CLOSE':
+            unsupported = 'Short cover (Buy to Close equity) is not supported'
+        elif trade_action == 'UNKNOWN':
+            unsupported = f"Unrecognized equity action: {legs[0].get('action', '')}"
+
+        # 'TRADE' for ordinary orders, else the Receive Deliver sub-type
+        source = 'TRADE'
+        if legs[0].get('transaction-type') == 'Receive Deliver':
+            source = (legs[0].get('transaction-sub-type') or 'RECEIVE DELIVER').upper()
+
+        return {
+            'instrument': 'STOCK',
+            'action': trade_action,
+            'order_id': order_id,
+            'legs': legs,
+            'underlying': self._get_underlying(legs[0]),
+            'strategy': 'Stock',
+            'trade_date': self._get_trade_date(legs[0]),
+            'expiration': '',
+            'strikes': '',
+            'quantity': quantity,
+            'price': self._get_stock_price(legs),
+            'net_price': self._calculate_net_price(legs),
+            'fees': self._calculate_fees(legs),
+            'source': source,
+            'unsupported': unsupported,
+            'notes': '' if source == 'TRADE' else f"Shares via {source.title()}"
+        }
+
+    def _get_stock_quantity(self, legs: List[Dict]) -> int:
+        """Total share count across all legs of an equity order"""
+        total = 0.0
+        for leg in legs:
+            total += abs(float(leg.get('quantity') or 0))
+        return int(round(total))
+
+    def _get_stock_price(self, legs: List[Dict]) -> float:
+        """
+        Per-share price for an equity order, share-weighted across fills
+
+        Uses `value` (gross, pre-fee) rather than `net-value`, because the Stock
+        Log has no fee column and its existing rows record raw execution prices.
+        Assignment/exercise records carry value 0, so fall back to `price`
+        (the strike).
+        """
+        total_qty = 0.0
+        total_value = 0.0
+        for leg in legs:
+            total_qty += abs(float(leg.get('quantity') or 0))
+            total_value += abs(float(leg.get('value') or 0))
+
+        if total_qty and total_value:
+            return round(total_value / total_qty, 4)
+
+        price = legs[0].get('price')
+        return round(float(price), 4) if price else 0.0
 
     def _process_roll(self, order_id: str, opening_legs: List[Dict],
                      closing_legs: List[Dict]) -> Dict:

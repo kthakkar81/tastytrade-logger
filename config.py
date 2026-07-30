@@ -23,6 +23,18 @@ SHEET_TRADE_LOG = 'Trade Log'
 SHEET_OPEN_POSITIONS = 'Open Positions'
 SHEET_PENDING_TRADES = 'Pending Trades'
 
+# Equity ("Stock Log") worksheet. Shares are logged one row per lot; a sale
+# closes lots FIFO, splitting the last lot if the sale doesn't consume it whole.
+SHEET_STOCK_LOG = 'Stock Log'
+STOCK_LOG_HEADER = ['Entry Date', 'Exit Date', 'Ticker', 'Status', 'Qty',
+                    'Entry', 'Current/Exit', 'Total P/L:']
+
+# Non-Trade equity events that should still produce Stock Log rows. Option
+# assignment/exercise delivers or removes shares, so it belongs in the log.
+# ACAT transfers and dividends are deliberately excluded — the ACAT lots were
+# already entered by hand, and there is nowhere to put a dividend.
+EQUITY_RECEIVE_DELIVER_SUBTYPES = {'Assignment', 'Exercise'}
+
 # Transaction Classification
 OPTION_STRATEGIES = {
     'bull_put_spread': {

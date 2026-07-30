@@ -9,6 +9,7 @@ Automated trade logging system that syncs Tastytrade transactions to Google Shee
 - ✅ Detects and links rolls (including multi-leg spread rolls)
 - ✅ Matches closing trades to open positions
 - ✅ Handles partial closes
+- ✅ Logs share purchases and sales to the Stock Log (FIFO lot matching)
 - ✅ Calculates P&L automatically
 - ✅ Syncs to Google Sheets with pending review workflow
 
@@ -75,14 +76,38 @@ and the sync dies at import. That caused silent outages on 2026-07-16 and
 
 ## Google Sheets Structure
 
-### Tab 1: Trade Log
-Closed trades with full P&L
+Worksheets the logger reads or writes:
 
-### Tab 2: Open Positions
-Currently open positions with unrealized P&L
+| Worksheet | Written by logger | Contents |
+|---|---|---|
+| `Options Log` | yes | Option trades, one row per position, open and closed |
+| `Stock Log` | yes | Share lots, one row per lot, open and closed |
+| `Import Errors` | yes | Anything that couldn't be matched or classified |
+| `Sync Log` | yes | One heartbeat row per run |
+| `Options Analysis`, `Stock Analysis` | no | Kevin's own dashboards |
 
-### Tab 3: Pending Trades
-Review queue - check boxes to confirm before moving to Trade Log
+### Stock Log
+
+`Entry Date | Exit Date | Ticker | Status | Qty | Entry | Current/Exit | Total P/L`
+
+One row per **lot**. While a lot is open, `Current/Exit` holds
+`=IF(D{r}="OPEN", GOOGLEFINANCE(C{r}), "ENTER PRICE")`; closing it replaces that
+with the literal exit price. `Total P/L` is always `=(G{r}-F{r})*E{r}`.
+
+- **Buys** append a new lot. `Entry` is the raw share-weighted execution price —
+  the sheet has no fee column, so fees are dropped, matching the rows entered by
+  hand. Multiple fills of one order are consolidated into a single lot.
+- **Sales** close lots **FIFO** (oldest entry date first). If the sale doesn't
+  consume the last lot whole, that row is split: the sold shares are closed in
+  place and the remainder is re-inserted directly below as a still-open lot.
+- **Assignment/exercise** (`Receive Deliver`) delivers or removes shares and is
+  logged at the strike. ACAT transfers and dividends are deliberately ignored.
+- **Long only.** Short stock (`Sell to Open` / `Buy to Close` equity) goes to
+  Import Errors rather than being guessed at, because `=(G-F)*E` assumes a long.
+- Re-running is idempotent: a buy is a duplicate if a lot with the same ticker,
+  entry date and entry price already exists (including rows entered by hand); a
+  sale is a duplicate if closed rows at that ticker, exit date and exit price
+  already total the sale.
 
 ## Project Structure
 

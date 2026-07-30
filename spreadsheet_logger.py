@@ -25,6 +25,7 @@ class SpreadsheetLogger:
         self.spreadsheet = None
         self.sheet = None
         self.error_sheet = None
+        self.stock_sheet = None
 
     def authenticate(self) -> bool:
         """
@@ -78,6 +79,17 @@ class SpreadsheetLogger:
                     'Date', 'Underlying', 'Strategy', 'Expiration',
                     'Strikes', 'Action', 'Error', 'Details'
                 ])
+
+            # Equity log. Absence is not fatal — options syncing still works,
+            # and stock trades fall through to Import Errors where they're visible.
+            try:
+                self.stock_sheet = spreadsheet.worksheet(config.SHEET_STOCK_LOG)
+                if self.stock_sheet.row_values(1) != config.STOCK_LOG_HEADER:
+                    print(f"⚠ '{config.SHEET_STOCK_LOG}' header differs from "
+                          f"expected {config.STOCK_LOG_HEADER} — not modifying it")
+            except gspread.exceptions.WorksheetNotFound:
+                print(f"⚠ '{config.SHEET_STOCK_LOG}' worksheet not found — "
+                      f"stock trades will be logged to Import Errors")
 
             print(f"✓ Connected to spreadsheet: {spreadsheet.title}")
             return True
@@ -797,6 +809,11 @@ class SpreadsheetLogger:
             return False
 
         try:
+            # Share trades live on their own worksheet with their own matching
+            # rules (FIFO lots, no strikes/expiration)
+            if trade.get('instrument') == 'STOCK':
+                return self.append_stock_trade(trade)
+
             action = trade.get('action', '')
             strategy = trade.get('strategy', trade.get('new_strategy', ''))
 
@@ -1077,6 +1094,334 @@ class SpreadsheetLogger:
             traceback.print_exc()
             return None
 
+    # ------------------------------------------------------------------
+    # Stock Log (equity shares)
+    #
+    # Layout: A Entry Date | B Exit Date | C Ticker | D Status | E Qty |
+    #         F Entry | G Current/Exit | H Total P/L
+    # One row per lot. G is a GOOGLEFINANCE formula while the lot is Open and a
+    # literal exit price once Closed; H is always =(G-F)*E. Prices are raw
+    # execution prices — the sheet has no fee column, matching the rows that
+    # were entered by hand.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _norm_date(date_str: str) -> str:
+        """Normalize 'm/d/yyyy' variants so 07/28/2026 == 7/28/2026"""
+        if not date_str:
+            return ''
+        parts = str(date_str).strip().split('/')
+        if len(parts) == 3:
+            try:
+                return f"{int(parts[0])}/{int(parts[1])}/{parts[2]}"
+            except ValueError:
+                pass
+        return str(date_str).strip()
+
+    @staticmethod
+    def _date_sort_key(date_str: str):
+        """Sortable key for 'm/d/yyyy'; unparseable dates sort last"""
+        parts = str(date_str).strip().split('/')
+        if len(parts) == 3:
+            try:
+                return (int(parts[2]), int(parts[0]), int(parts[1]))
+            except ValueError:
+                pass
+        return (9999, 99, 99)
+
+    @staticmethod
+    def _parse_money(value) -> float:
+        """Parse a displayed currency/number cell into a float (0.0 if blank)"""
+        if value is None or value == '':
+            return 0.0
+        text = (str(value).replace('$', '').replace(',', '')
+                .replace('(', '-').replace(')', '').strip())
+        try:
+            return float(text)
+        except ValueError:
+            return 0.0
+
+    @staticmethod
+    def _stock_formulas(row_num: int):
+        """(Current/Exit, Total P/L) formulas for an open lot on the given row"""
+        return (
+            f'=IF(D{row_num}="OPEN", GOOGLEFINANCE(C{row_num}), "ENTER PRICE")',
+            f'=(G{row_num}-F{row_num})*E{row_num}'
+        )
+
+    @staticmethod
+    def _price_matches(a: float, b: float) -> bool:
+        """
+        Compare two per-share prices at cent resolution
+
+        The sheet renders prices at 2dp, so a value read back from it can only
+        ever be compared to that precision.
+        """
+        return abs(round(a, 2) - round(b, 2)) < 0.005
+
+    def _read_stock_rows(self) -> List[Dict]:
+        """
+        Read the Stock Log into structured lot records
+
+        Returns:
+            List of dicts with row number and parsed field values, data rows only
+        """
+        all_values = self.stock_sheet.get_all_values()
+        lots = []
+
+        for idx, raw in enumerate(all_values[1:], start=2):
+            row = list(raw) + [''] * (8 - len(raw))
+            ticker = row[2].strip().upper()
+            if not ticker:
+                continue
+
+            lots.append({
+                'row': idx,
+                'entry_date': self._norm_date(row[0]),
+                'exit_date': self._norm_date(row[1]),
+                'ticker': ticker,
+                'status': row[3].strip().lower(),
+                'qty': int(round(self._parse_money(row[4]))),
+                'entry': self._parse_money(row[5]),
+                'exit': self._parse_money(row[6]),
+            })
+
+        return lots
+
+    def append_stock_trade(self, trade: Dict) -> bool:
+        """
+        Log an equity trade to the Stock Log
+
+        Args:
+            trade: Stock trade dict from TransactionProcessor (instrument='STOCK')
+
+        Returns:
+            bool: True if the trade was logged or was already present
+        """
+        if not self.stock_sheet:
+            self.log_error(trade, f"'{config.SHEET_STOCK_LOG}' worksheet not found")
+            print(f"✗ No {config.SHEET_STOCK_LOG} worksheet - logged to Import Errors")
+            return False
+
+        unsupported = trade.get('unsupported')
+        if unsupported:
+            self.log_error(trade, unsupported)
+            print(f"✗ {trade.get('underlying')}: {unsupported} - logged to Import Errors")
+            return False
+
+        action = trade.get('action', '')
+
+        try:
+            if action == 'OPEN':
+                return self._open_stock_position(trade)
+            if action == 'CLOSE':
+                return self._close_stock_position(trade)
+
+            self.log_error(trade, f'Unsupported stock action: {action}')
+            print(f"✗ Unsupported stock action '{action}' for "
+                  f"{trade.get('underlying')} - logged to Import Errors")
+            return False
+
+        except Exception as e:
+            self.log_error(trade, f'Processing error: {e}')
+            print(f"✗ Failed to log stock trade: {e} - logged to Import Errors")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def _open_stock_position(self, trade: Dict) -> bool:
+        """
+        Append a new share lot to the Stock Log
+
+        Idempotent: an existing lot with the same ticker, entry date and entry
+        price counts as already logged, whether this run wrote it or it was
+        entered by hand. Rows already closed (or split by a partial sale) still
+        carry their original entry date and price, so they match too.
+        """
+        ticker = trade.get('underlying', '').upper()
+        qty = trade.get('quantity', 0)
+        price = trade.get('price', 0.0)
+        entry_date = self._norm_date(trade.get('trade_date', ''))
+
+        existing_qty = sum(
+            lot['qty'] for lot in self._read_stock_rows()
+            if lot['ticker'] == ticker
+            and lot['entry_date'] == entry_date
+            and self._price_matches(lot['entry'], price)
+        )
+
+        if existing_qty >= qty:
+            print(f"⊘ Skipped duplicate stock OPEN {ticker} {qty} @ ${price:,.2f} "
+                  f"on {entry_date} (already logged, {existing_qty} shares)")
+            self.clear_error(trade)
+            return True
+
+        target_row = self._next_stock_row()
+        current_exit, total_pl = self._stock_formulas(target_row)
+        row = [entry_date, '', ticker, 'Open', qty, price, current_exit, total_pl]
+
+        self.stock_sheet.update(values=[row],
+                                range_name=f'A{target_row}:H{target_row}',
+                                value_input_option='USER_ENTERED')
+        self._format_stock_row(target_row)
+
+        source = trade.get('source', 'TRADE')
+        via = '' if source == 'TRADE' else f" (via {source.title()})"
+        print(f"✓ Logged stock OPEN {ticker} {qty} @ ${price:,.2f} "
+              f"on {entry_date} → {config.SHEET_STOCK_LOG} row {target_row}{via}")
+
+        self.clear_error(trade)
+        return True
+
+    def _close_stock_position(self, trade: Dict) -> bool:
+        """
+        Close share lots FIFO against a sale
+
+        Oldest lots are consumed first. If the sale doesn't consume the last lot
+        whole, that row is split: the sold shares are closed in place and the
+        remainder is re-inserted directly below as a still-open lot.
+        """
+        ticker = trade.get('underlying', '').upper()
+        sell_qty = trade.get('quantity', 0)
+        exit_price = trade.get('price', 0.0)
+        exit_date = self._norm_date(trade.get('trade_date', ''))
+
+        lots = self._read_stock_rows()
+
+        # Already applied on an earlier run inside the lookback window? Closes
+        # are aggregated per (ticker, date, price) before we get here, so the
+        # closed shares at this exact date and price should total this sale.
+        already_closed = sum(
+            lot['qty'] for lot in lots
+            if lot['ticker'] == ticker
+            and lot['status'] == 'closed'
+            and lot['exit_date'] == exit_date
+            and self._price_matches(lot['exit'], exit_price)
+        )
+        if already_closed >= sell_qty:
+            print(f"⊘ Skipped duplicate stock CLOSE {ticker} {sell_qty} @ "
+                  f"${exit_price:,.2f} on {exit_date} (already closed)")
+            self.clear_error(trade)
+            return True
+
+        open_lots = sorted(
+            (lot for lot in lots
+             if lot['ticker'] == ticker and lot['status'] == 'open' and lot['qty'] > 0),
+            key=lambda lot: (self._date_sort_key(lot['entry_date']), lot['row'])
+        )
+        total_open = sum(lot['qty'] for lot in open_lots)
+
+        if not total_open:
+            self.log_error(trade, f'No open {ticker} stock lots to close')
+            print(f"✗ No open {ticker} lots for sale of {sell_qty} "
+                  f"- logged to Import Errors")
+            return False
+
+        if total_open < sell_qty:
+            self.log_error(
+                trade,
+                f'Quantity mismatch: open lots total {total_open} shares, '
+                f'sale is {sell_qty}')
+            print(f"✗ {ticker} quantity mismatch (open={total_open}, "
+                  f"sell={sell_qty}) - logged to Import Errors")
+            return False
+
+        # Walk the lots FIFO; at most the final one is partially consumed
+        remaining = sell_qty
+        full_closes = []
+        partial = None
+        for lot in open_lots:
+            if remaining <= 0:
+                break
+            if lot['qty'] <= remaining:
+                full_closes.append(lot)
+                remaining -= lot['qty']
+            else:
+                partial = (lot, remaining)
+                remaining = 0
+
+        # Close whole lots and the sold portion of the split lot in one batch.
+        # Writing a literal into G replaces its GOOGLEFINANCE formula; H stays
+        # =(G-F)*E and recomputes against the exit price.
+        updates = []
+        for lot in full_closes:
+            updates.append({'range': f"B{lot['row']}", 'values': [[exit_date]]})
+            updates.append({'range': f"D{lot['row']}", 'values': [['Closed']]})
+            updates.append({'range': f"G{lot['row']}", 'values': [[exit_price]]})
+
+        if partial:
+            lot, sold_qty = partial
+            updates.append({'range': f"B{lot['row']}", 'values': [[exit_date]]})
+            updates.append({'range': f"D{lot['row']}", 'values': [['Closed']]})
+            updates.append({'range': f"E{lot['row']}", 'values': [[sold_qty]]})
+            updates.append({'range': f"G{lot['row']}", 'values': [[exit_price]]})
+
+        self.stock_sheet.batch_update(updates, value_input_option='USER_ENTERED')
+
+        for lot in full_closes:
+            print(f"  ✓ Closed {ticker} lot of {lot['qty']} @ ${lot['entry']:,.2f} "
+                  f"({lot['entry_date']}) at ${exit_price:,.2f} — row {lot['row']}")
+
+        # Re-insert the unsold remainder as its own open lot. Done last so the
+        # row shift can't invalidate the updates above.
+        if partial:
+            lot, sold_qty = partial
+            keep_qty = lot['qty'] - sold_qty
+            new_row = lot['row'] + 1
+            current_exit, total_pl = self._stock_formulas(new_row)
+            self.stock_sheet.insert_row(
+                [lot['entry_date'], '', ticker, 'Open', keep_qty, lot['entry'],
+                 current_exit, total_pl],
+                new_row, value_input_option='USER_ENTERED')
+            self._format_stock_row(new_row)
+            print(f"  ✓ Split {ticker} lot at row {lot['row']}: "
+                  f"{sold_qty} closed @ ${exit_price:,.2f}, "
+                  f"{keep_qty} left open @ ${lot['entry']:,.2f} (row {new_row})")
+
+        print(f"✓ Logged stock CLOSE {ticker} {sell_qty} @ ${exit_price:,.2f} "
+              f"on {exit_date} ({len(full_closes)} lot(s) closed"
+              f"{', 1 split' if partial else ''})")
+
+        self.clear_error(trade)
+        return True
+
+    def _next_stock_row(self) -> int:
+        """First Stock Log row with no ticker in column C"""
+        all_values = self.stock_sheet.get_all_values()
+        last_data_row = 1
+        for idx, raw in enumerate(all_values, start=1):
+            if len(raw) > 2 and raw[2].strip():
+                last_data_row = idx
+        return last_data_row + 1
+
+    def _format_stock_row(self, row_num: int):
+        """
+        Match a new Stock Log row to the formatting of the existing rows:
+        Arial 10, dates in A/B, left-aligned ticker and status, currency in F:H
+        """
+        try:
+            base = {'verticalAlignment': 'MIDDLE',
+                    'textFormat': {'fontFamily': 'Arial', 'fontSize': 10,
+                                   'bold': False}}
+            date_fmt = {'type': 'DATE', 'pattern': 'm/d/yyyy'}
+            money_fmt = {'type': 'CURRENCY', 'pattern': '"$"#,##0.00'}
+
+            self.stock_sheet.batch_format([
+                {'range': f'A{row_num}:B{row_num}',
+                 'format': {**base, 'horizontalAlignment': 'RIGHT',
+                            'numberFormat': date_fmt}},
+                {'range': f'C{row_num}:D{row_num}',
+                 'format': {**base, 'horizontalAlignment': 'LEFT'}},
+                {'range': f'E{row_num}',
+                 'format': {**base, 'horizontalAlignment': 'RIGHT'}},
+                {'range': f'F{row_num}:H{row_num}',
+                 'format': {**base, 'horizontalAlignment': 'RIGHT',
+                            'numberFormat': money_fmt}},
+            ])
+        except Exception as e:
+            # Formatting is cosmetic - never fail the write over it
+            print(f"⚠ Failed to format {config.SHEET_STOCK_LOG} row {row_num}: {e}")
+
     def log_error(self, trade: Dict, error_msg: str):
         """
         Log a trade error to the Import Errors sheet
@@ -1093,6 +1438,11 @@ class SpreadsheetLogger:
             # ROLL trades carry new_*/old_* keys rather than the flat ones, so
             # fall back to the new leg. clear_error() resolves these fields the
             # same way — if the two disagree, an error can never be cleared.
+            details = (f"Date: {trade.get('trade_date', '')}, "
+                       f"Qty: {trade.get('quantity', '')}")
+            if trade.get('instrument') == 'STOCK':
+                details += f", Price: ${trade.get('price', 0):,.2f}"
+
             error_row = [
                 datetime.now().strftime('%Y-%m-%d %H:%M:%S'),  # Timestamp
                 trade.get('underlying', ''),
@@ -1101,7 +1451,7 @@ class SpreadsheetLogger:
                 trade.get('strikes') or trade.get('new_strikes', ''),
                 trade.get('action', ''),
                 error_msg,
-                f"Date: {trade.get('trade_date', '')}, Qty: {trade.get('quantity', '')}"
+                details
             ]
             self.error_sheet.append_row(error_row)
         except Exception as e:
@@ -1180,6 +1530,19 @@ class SpreadsheetLogger:
                     error_action == action):
 
                     rows_to_delete.append(i + 1)  # 1-indexed row number
+                    continue
+
+                # Legacy equity errors: before share logging existed, the
+                # options classifier saw a bare ticker and filed equity legs as
+                # 'Unknown' with no expiration or strikes. Nothing else produces
+                # that shape for a ticker we can now log, so clear it too.
+                if (trade.get('instrument') == 'STOCK' and
+                    error_strategy == 'Unknown' and
+                    not error_expiration and not error_strikes and
+                    error_underlying == underlying and
+                    error_action == action):
+
+                    rows_to_delete.append(i + 1)
 
             # Delete matching rows
             for row_num in rows_to_delete:
@@ -1204,12 +1567,18 @@ class SpreadsheetLogger:
         """
         from collections import defaultdict
 
+        # Stock trades have no strikes to group on and need share-weighted
+        # prices, so they aggregate under their own rules
+        stock_trades = [t for t in trades if t.get('instrument') == 'STOCK']
+        trades = [t for t in trades if t.get('instrument') != 'STOCK']
+        stock_trades = self._aggregate_stock_trades(stock_trades)
+
         # Separate CLOSE trades from others
         close_trades = [t for t in trades if t.get('action') == 'CLOSE']
         other_trades = [t for t in trades if t.get('action') != 'CLOSE']
 
         if not close_trades:
-            return trades
+            return trades + stock_trades
 
         # Group CLOSE trades by position key
         grouped = defaultdict(list)
@@ -1249,7 +1618,54 @@ class SpreadsheetLogger:
                 aggregated_closes.append(aggregated)
 
         # Return all trades with aggregated closes
-        return other_trades + aggregated_closes
+        return other_trades + aggregated_closes + stock_trades
+
+    def _aggregate_stock_trades(self, trades: List[Dict]) -> List[Dict]:
+        """
+        Combine stock orders that are indistinguishable on the Stock Log
+
+        Two orders for the same ticker, side, date and per-share price produce
+        rows this logger cannot tell apart, which would break duplicate
+        detection on a re-run (the first would satisfy the second's check).
+        Merging them into one logical trade keeps the share counts exact.
+
+        Args:
+            trades: Stock trade dicts (instrument='STOCK')
+
+        Returns:
+            List of stock trades with indistinguishable orders merged
+        """
+        from collections import defaultdict
+
+        if not trades:
+            return []
+
+        grouped = defaultdict(list)
+        for trade in trades:
+            key = (
+                trade.get('action', ''),
+                trade.get('underlying', '').upper(),
+                trade.get('trade_date', ''),
+                round(trade.get('price', 0.0), 2),
+                bool(trade.get('unsupported')),
+            )
+            grouped[key].append(trade)
+
+        merged = []
+        for group in grouped.values():
+            if len(group) == 1:
+                merged.append(group[0])
+                continue
+
+            print(f"  Aggregating {len(group)} stock {group[0].get('action')} orders "
+                  f"for {group[0].get('underlying')} @ ${group[0].get('price', 0):,.2f}")
+            combined = group[0].copy()
+            combined['quantity'] = sum(t.get('quantity', 0) for t in group)
+            combined['fees'] = sum(t.get('fees', 0) for t in group)
+            combined['net_price'] = sum(t.get('net_price', 0) for t in group)
+            merged.append(combined)
+
+        return merged
 
     def log_run(self, status: str, date_range: str = '',
                 trades_logged=0, details: str = '') -> bool:
