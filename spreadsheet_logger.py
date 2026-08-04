@@ -169,6 +169,7 @@ class SpreadsheetLogger:
                 '',                     # Closing Net Price (blank for opens)
                 quantity,               # Contracts (number)
                 '',                     # Total PnL (blank for opens)
+                '',                     # ROC (blank; sheet formula fills this in)
                 notes                   # Notes/Setup
             ]
 
@@ -208,6 +209,7 @@ class SpreadsheetLogger:
                 net_price,              # Closing Net Price (number)
                 quantity,               # Contracts (number)
                 '',                     # Total PnL (calculate manually)
+                '',                     # ROC (blank; sheet formula fills this in)
                 notes                   # Notes
             ]
 
