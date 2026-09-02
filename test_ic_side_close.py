@@ -54,6 +54,9 @@ class StubSheet:
     def format(self, *args, **kwargs):
         pass
 
+    def batch_format(self, *args, **kwargs):
+        pass
+
 
 @pytest.fixture(scope='module')
 def trades():

@@ -1223,15 +1223,23 @@ class SpreadsheetLogger:
             row_num: Row number to format (1-indexed)
         """
         try:
-            # Apply RIGHT alignment to all columns to match existing rows
-            self.sheet.format(f'A{row_num}:P{row_num}', {
-                'horizontalAlignment': 'RIGHT',
-                'verticalAlignment': 'MIDDLE'
-            })
+            # Underlying, Strategy Type and Status are labels rather than
+            # figures and read left-aligned throughout this sheet, the same way
+            # the Stock Log left-aligns its ticker and status. Everything else
+            # - dates, strikes, money, contract counts - right-aligns.
+            middle = {'verticalAlignment': 'MIDDLE'}
+            self.sheet.batch_format([
+                {'range': f'A{row_num}:B{row_num}',
+                 'format': {**middle, 'horizontalAlignment': 'RIGHT'}},
+                {'range': f'C{row_num}:E{row_num}',
+                 'format': {**middle, 'horizontalAlignment': 'LEFT'}},
+                {'range': f'F{row_num}:P{row_num}',
+                 'format': {**middle, 'horizontalAlignment': 'RIGHT'}},
+            ])
 
         except Exception as e:
-            # Don't fail the whole operation if formatting fails
-            pass
+            # Formatting is cosmetic - never fail the write over it
+            print(f"⚠ Failed to format row {row_num}: {e}")
 
     def _split_open_row(self, row_num: int, qty1: int, qty2: int):
         """
