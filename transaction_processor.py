@@ -11,6 +11,10 @@ import config
 class TransactionProcessor:
     """Process and classify option transactions"""
 
+    # Offset of the call/put flag in an OCC option symbol: a six-character
+    # padded root, then YYMMDD, then 'C' or 'P'. E.g. "NOW   260918C00150000".
+    OCC_TYPE_INDEX = 12
+
     def __init__(self):
         self.transactions = []
         self.grouped_orders = defaultdict(list)
@@ -147,7 +151,7 @@ class TransactionProcessor:
 
     def _process_open(self, order_id: str, legs: List[Dict]) -> Dict:
         """Process opening transaction(s)"""
-        return {
+        trade = {
             'action': 'OPEN',
             'order_id': order_id,
             'legs': legs,
@@ -161,6 +165,15 @@ class TransactionProcessor:
             'fees': self._calculate_fees(legs),
             'notes': ''
         }
+
+        # An iron condor is routinely adjusted one side at a time, which leaves
+        # the surviving vertical needing its own share of the opening credit.
+        # That split can't be recovered from the closing fills later, so record
+        # it now, while all four legs are in hand.
+        if trade['strategy'] == 'IC':
+            trade['side_breakdown'] = self._split_ic_sides(legs)
+
+        return trade
 
     def _process_close(self, order_id: str, legs: List[Dict]) -> Dict:
         """Process closing transaction(s)"""
@@ -435,6 +448,48 @@ class TransactionProcessor:
             qty = legs[0].get('quantity', 0)
             return abs(int(float(qty)))
         return 0
+
+    def _option_type(self, leg: Dict) -> str:
+        """
+        Return 'C' or 'P' for an option leg, or '' if the symbol isn't one.
+
+        OCC symbols pad the root to six characters and carry the call/put flag
+        at a fixed offset, so read that position rather than scanning for a
+        'C' or 'P' - those also occur in roots like CRWD and SPX.
+        """
+        symbol = leg.get('symbol', '')
+        if (len(symbol) > self.OCC_TYPE_INDEX
+                and symbol[self.OCC_TYPE_INDEX] in ('C', 'P')):
+            return symbol[self.OCC_TYPE_INDEX]
+        return ''
+
+    def _split_ic_sides(self, legs: List[Dict]) -> Dict:
+        """
+        Break an iron condor's four legs into its call and put verticals.
+
+        Returns {'C': {...}, 'P': {...}} carrying each side's strikes, net
+        credit and fees, or {} if the legs don't split cleanly into two calls
+        and two puts - in which case the IC is logged as before, just without
+        a recorded split.
+        """
+        sides = {'C': [], 'P': []}
+        for leg in legs:
+            opt_type = self._option_type(leg)
+            if opt_type not in sides:
+                return {}
+            sides[opt_type].append(leg)
+
+        if len(sides['C']) != 2 or len(sides['P']) != 2:
+            return {}
+
+        return {
+            opt_type: {
+                'strikes': self._get_strikes(side_legs),
+                'net_price': self._calculate_net_price(side_legs),
+                'fees': self._calculate_fees(side_legs),
+            }
+            for opt_type, side_legs in sides.items()
+        }
 
     def _calculate_net_price(self, legs: List[Dict]) -> float:
         """

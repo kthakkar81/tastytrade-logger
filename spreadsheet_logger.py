@@ -5,9 +5,22 @@ Writes processed trades to Google Sheets trading log
 from typing import List, Dict
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import re
 import gspread
 from google.oauth2.service_account import Credentials
 import config
+
+
+# Per-side credits recorded in an iron condor row's Notes, e.g.
+#   "Call side: $150.00/$145.00 credit $115.50"
+# Written when the IC is opened and read back if one side is later bought back
+# on its own; without it the surviving vertical's share of the opening credit
+# cannot be recovered from the closing fills.
+IC_SIDE_NOTE_RE = re.compile(r'(Call|Put) side: (\S+) credit \$(-?[\d,]+\.\d{2})')
+
+# An iron condor is by construction a short call vertical above the money and a
+# short put vertical below it, so each side's strategy follows from its type.
+IC_SIDE_STRATEGY = {'Call': 'Bear Call Spread', 'Put': 'Bull Put Spread'}
 
 
 class SpreadsheetLogger:
@@ -146,7 +159,7 @@ class SpreadsheetLogger:
 
             # For IC (Iron Condor), put strikes in notes and leave strike columns blank
             if strategy == 'IC':
-                notes = f"Strikes: {strikes_str}"
+                notes = self._ic_notes(strikes_str, trade.get('side_breakdown'))
                 short_strike = ''
                 long_strike = ''
             else:
@@ -663,13 +676,17 @@ class SpreadsheetLogger:
             traceback.print_exc()
             return None
 
-    def update_close_trade(self, row_num: int, trade: Dict) -> bool:
+    def update_close_trade(self, row_num: int, trade: Dict,
+                           fees_override: float = None) -> bool:
         """
         Update existing OPEN row with CLOSE information
 
         Args:
             row_num: Row number to update (1-indexed)
             trade: CLOSE trade data
+            fees_override: Total to write to the fee column instead of
+                (existing fees + close fees). Used when closing one side of an
+                iron condor, where the other side's fees leave with it.
 
         Returns:
             bool: True if successful
@@ -697,7 +714,8 @@ class SpreadsheetLogger:
             contracts = float(contracts_str)
 
             # Calculate cumulative fees
-            total_fees = existing_fees + close_fees
+            total_fees = (existing_fees + close_fees
+                          if fees_override is None else fees_override)
 
             # Calculate P&L: Column K + Column L
             # K and L are already total values for all contracts
@@ -725,6 +743,198 @@ class SpreadsheetLogger:
             import traceback
             traceback.print_exc()
             return False
+
+    @staticmethod
+    def _norm_underlying(symbol: str) -> str:
+        """SPXW/RUTW are the weeklies of SPX/RUT - treat them as the same root"""
+        if not symbol:
+            return ''
+        return symbol.replace('SPXW', 'SPX').replace('RUTW', 'RUT')
+
+    def _ic_notes(self, strikes_str: str, side_breakdown: Dict = None) -> str:
+        """
+        Build the Notes cell for an iron condor row.
+
+        All four strikes live in Notes because an IC doesn't fit the sheet's
+        single short/long strike columns. Recorded alongside them is what each
+        vertical was opened for, so that buying back one side later can carry
+        the other side's credit out to a row of its own.
+        """
+        notes = f"Strikes: {strikes_str}"
+        sides = side_breakdown or {}
+        for opt_type, label in (('C', 'Call'), ('P', 'Put')):
+            side = sides.get(opt_type)
+            if side:
+                notes += (f" | {label} side: {side['strikes']} "
+                          f"credit ${side['net_price']:,.2f}")
+        return notes
+
+    @staticmethod
+    def _parse_ic_sides(notes: str) -> Dict:
+        """Read back the per-side credits recorded in an IC row's Notes"""
+        return {
+            m.group(1): {'strikes': m.group(2),
+                         'credit': float(m.group(3).replace(',', ''))}
+            for m in IC_SIDE_NOTE_RE.finditer(notes or '')
+        }
+
+    def _find_open_ic_for_side(self, trade: Dict):
+        """
+        Find the iron condor row that this 2-leg close is one side of.
+
+        Returns a (status, detail) tuple:
+          ('found', (row_num, side_label, sides, row)) - convertible
+          ('already', row_num)        - this side was already carried out
+          ('no_side_data', row_num)   - the IC row predates per-side credits
+          ('no_ic', None)             - nothing matched
+        """
+        underlying = self._norm_underlying(trade.get('underlying', ''))
+        expiration = self._norm_date(trade.get('expiration', ''))
+        strikes_str = trade.get('strikes', '')
+        if not strikes_str or not underlying:
+            return ('no_ic', None)
+
+        legacy_row = None
+
+        for i, row in enumerate(self.sheet.get_all_values()):
+            if i == 0 or len(row) < 16:
+                continue
+            if (row[3] != 'IC'
+                    or self._norm_underlying(row[2]) != underlying
+                    or self._norm_date(row[5]) != expiration):
+                continue
+
+            notes = row[15]
+            sides = self._parse_ic_sides(notes)
+            label = next((name for name, side in sides.items()
+                          if side['strikes'] == strikes_str), None)
+
+            if label is None:
+                # Older IC rows carry only the four strikes. A close whose
+                # strikes sit inside that list is almost certainly one side,
+                # but without the recorded credit the row can't be split.
+                # Strikes are written calls-then-puts, each pair high to low,
+                # so a side's pair is always a contiguous substring.
+                if not sides and strikes_str in notes:
+                    legacy_row = i + 1
+                continue
+
+            if f"{label} side closed" in notes:
+                return ('already', i + 1)
+            if row[4] == 'Open':
+                return ('found', (i + 1, label, sides, row))
+
+        if legacy_row:
+            return ('no_side_data', legacy_row)
+        return ('no_ic', None)
+
+    def _convert_ic_side_close(self, trade: Dict) -> bool:
+        """
+        Close one vertical of an open iron condor, carrying the other side out
+        to a row of its own.
+
+        Buying back a single side is a routine IC adjustment - the tested side
+        is closed and the surviving vertical left to run. Those fills arrive as
+        an ordinary 2-leg CLOSE with no OPEN row to match, because the position
+        occupies a single 4-leg IC row.
+
+        The IC row is closed at the real side debit PLUS the surviving side's
+        opening credit. Carrying that credit out is what keeps the arithmetic
+        exact: the IC row then realises precisely the closed side's P&L, and
+        the surviving vertical opens its own row still holding the premium it
+        owes back, so the two rows always sum to the real total. It also leaves
+        the survivor as an ordinary spread row, which means its eventual close
+        matches automatically instead of erroring again.
+
+        Returns a (handled, ok) tuple. 'handled' says this close belongs to an
+        IC and the caller should not fall back to its generic no-match error -
+        any error worth reporting has already been logged here.
+        """
+        status, detail = self._find_open_ic_for_side(trade)
+
+        if status == 'already':
+            print(f"⊘ Skipped duplicate IC side close {trade.get('underlying')} "
+                  f"{trade.get('strikes')} (already carried out at row {detail})")
+            return (True, True)
+
+        if status == 'no_side_data':
+            self.log_error(trade,
+                           f"Looks like one side of the IC at row {detail}, but "
+                           "that row has no per-side credit recorded - split by hand")
+            print(f"✗ IC at row {detail} has no recorded per-side credit "
+                  f"- logged to Import Errors")
+            return (True, False)
+
+        if status != 'found':
+            return (False, False)
+
+        ic_row_num, label, sides, ic_row = detail
+        survivor_label = 'Put' if label == 'Call' else 'Call'
+        survivor = sides.get(survivor_label)
+        if not survivor:
+            return (False, False)
+
+        close_date = trade.get('trade_date', '')
+        quantity = int(float(ic_row[12] or 0))
+
+        # Closing only part of a side would leave some of that vertical still
+        # open, which a whole-row conversion cannot represent. Surface it
+        # instead of silently closing the IC and inventing a full-size survivor.
+        close_qty = trade.get('quantity', 0)
+        if close_qty != quantity:
+            self.log_error(trade,
+                           f"Partial IC side close: IC at row {ic_row_num} holds "
+                           f"{quantity} contracts, closing {close_qty} - split by hand")
+            print(f"✗ Partial IC side close for {trade.get('underlying')} "
+                  f"(row {ic_row_num} holds {quantity}, closing {close_qty}) "
+                  f"- logged to Import Errors")
+            return (True, False)
+
+        # Fees are informational - P&L uses columns K and L only - so the IC's
+        # opening fees simply split evenly between the two verticals rather
+        # than being re-derived per leg.
+        side_fees = self._parse_money(ic_row[9]) / 2
+
+        # 1. Close the IC row, carrying the surviving side's credit out with it.
+        carried = survivor['credit']
+        closing_trade = dict(trade)
+        closing_trade['net_price'] = trade.get('net_price', 0) - carried
+        if not self.update_close_trade(
+                ic_row_num, closing_trade,
+                fees_override=side_fees + trade.get('fees', 0)):
+            self.log_error(trade, f"Failed to close IC row {ic_row_num} for side close")
+            return (True, False)
+
+        # 2. Open the surviving vertical as a position in its own right. It
+        #    keeps the IC's entry date, because that is when the risk went on.
+        survivor_trade = {
+            'action': 'OPEN',
+            'underlying': trade.get('underlying', ''),
+            'strategy': IC_SIDE_STRATEGY[survivor_label],
+            'trade_date': ic_row[0],
+            'expiration': trade.get('expiration', ''),
+            'strikes': survivor['strikes'],
+            'quantity': quantity,
+            'net_price': carried,
+            'fees': side_fees,
+        }
+        row = self.format_trade_row(survivor_trade)
+        row[15] = (f"{survivor_label} side of IC (row {ic_row_num}), "
+                   f"carried out {close_date}")
+        survivor_row_num = self._append_row_at_column_a(row)
+        self.format_new_row(survivor_row_num)
+
+        # 3. Mark the IC row, so a re-run inside the lookback window recognises
+        #    the conversion instead of applying it a second time.
+        self.sheet.update_acell(
+            f'P{ic_row_num}',
+            f"{ic_row[15]} | {label} side closed {close_date} "
+            f"-> row {survivor_row_num}")
+
+        print(f"⚙ IC row {ic_row_num}: closed {label.lower()} side, carried "
+              f"{survivor_label.lower()} side {survivor['strikes']} "
+              f"(${carried:,.2f}) out to row {survivor_row_num}")
+        return (True, True)
 
     def _close_matching_open_rows(self, close_trade: Dict):
         """
@@ -910,6 +1120,15 @@ class SpreadsheetLogger:
                         # Clear any associated import errors since the trade is already successfully logged
                         self.clear_error(trade)
                         return True  # Return success since it's already closed
+
+                    # A 2-leg close with no open row of its own may be one
+                    # side of an iron condor being bought back, which is a
+                    # routine adjustment rather than an error.
+                    handled, ok = self._convert_ic_side_close(trade)
+                    if handled:
+                        if ok:
+                            self.clear_error(trade)
+                        return ok
 
                     # No matching OPEN found and not already closed - log to error sheet
                     self.log_error(trade, 'No matching OPEN found')
