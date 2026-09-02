@@ -846,14 +846,16 @@ class SpreadsheetLogger:
         the survivor as an ordinary spread row, which means its eventual close
         matches automatically instead of erroring again.
 
-        Returns True if a conversion was applied, or had already been applied.
+        Returns a (handled, ok) tuple. 'handled' says this close belongs to an
+        IC and the caller should not fall back to its generic no-match error -
+        any error worth reporting has already been logged here.
         """
         status, detail = self._find_open_ic_for_side(trade)
 
         if status == 'already':
             print(f"⊘ Skipped duplicate IC side close {trade.get('underlying')} "
                   f"{trade.get('strikes')} (already carried out at row {detail})")
-            return True
+            return (True, True)
 
         if status == 'no_side_data':
             self.log_error(trade,
@@ -861,19 +863,32 @@ class SpreadsheetLogger:
                            "that row has no per-side credit recorded - split by hand")
             print(f"✗ IC at row {detail} has no recorded per-side credit "
                   f"- logged to Import Errors")
-            return False
+            return (True, False)
 
         if status != 'found':
-            return False
+            return (False, False)
 
         ic_row_num, label, sides, ic_row = detail
         survivor_label = 'Put' if label == 'Call' else 'Call'
         survivor = sides.get(survivor_label)
         if not survivor:
-            return False
+            return (False, False)
 
         close_date = trade.get('trade_date', '')
         quantity = int(float(ic_row[12] or 0))
+
+        # Closing only part of a side would leave some of that vertical still
+        # open, which a whole-row conversion cannot represent. Surface it
+        # instead of silently closing the IC and inventing a full-size survivor.
+        close_qty = trade.get('quantity', 0)
+        if close_qty != quantity:
+            self.log_error(trade,
+                           f"Partial IC side close: IC at row {ic_row_num} holds "
+                           f"{quantity} contracts, closing {close_qty} - split by hand")
+            print(f"✗ Partial IC side close for {trade.get('underlying')} "
+                  f"(row {ic_row_num} holds {quantity}, closing {close_qty}) "
+                  f"- logged to Import Errors")
+            return (True, False)
 
         # Fees are informational - P&L uses columns K and L only - so the IC's
         # opening fees simply split evenly between the two verticals rather
@@ -887,7 +902,8 @@ class SpreadsheetLogger:
         if not self.update_close_trade(
                 ic_row_num, closing_trade,
                 fees_override=side_fees + trade.get('fees', 0)):
-            return False
+            self.log_error(trade, f"Failed to close IC row {ic_row_num} for side close")
+            return (True, False)
 
         # 2. Open the surviving vertical as a position in its own right. It
         #    keeps the IC's entry date, because that is when the risk went on.
@@ -918,7 +934,7 @@ class SpreadsheetLogger:
         print(f"⚙ IC row {ic_row_num}: closed {label.lower()} side, carried "
               f"{survivor_label.lower()} side {survivor['strikes']} "
               f"(${carried:,.2f}) out to row {survivor_row_num}")
-        return True
+        return (True, True)
 
     def _close_matching_open_rows(self, close_trade: Dict):
         """
@@ -1108,9 +1124,11 @@ class SpreadsheetLogger:
                     # A 2-leg close with no open row of its own may be one
                     # side of an iron condor being bought back, which is a
                     # routine adjustment rather than an error.
-                    if self._convert_ic_side_close(trade):
-                        self.clear_error(trade)
-                        return True
+                    handled, ok = self._convert_ic_side_close(trade)
+                    if handled:
+                        if ok:
+                            self.clear_error(trade)
+                        return ok
 
                     # No matching OPEN found and not already closed - log to error sheet
                     self.log_error(trade, 'No matching OPEN found')
