@@ -11,16 +11,16 @@ from google.oauth2.service_account import Credentials
 import config
 
 
-# Per-side credits recorded in an iron condor row's Notes, e.g.
+# Per-side opening prices recorded in a four-leg row's Notes, e.g.
 #   "Call side: $150.00/$145.00 credit $115.50"
-# Written when the IC is opened and read back if one side is later bought back
-# on its own; without it the surviving vertical's share of the opening credit
-# cannot be recovered from the closing fills.
-IC_SIDE_NOTE_RE = re.compile(r'(Call|Put) side: (\S+) credit \$(-?[\d,]+\.\d{2})')
-
-# An iron condor is by construction a short call vertical above the money and a
-# short put vertical below it, so each side's strategy follows from its type.
-IC_SIDE_STRATEGY = {'Call': 'Bear Call Spread', 'Put': 'Bull Put Spread'}
+#   "Call side: $150.00/$145.00 debit $374.48"     (a superbull's call side)
+# Written when the position is opened and read back if one side is later closed
+# on its own; without it the surviving vertical's share of the opening price
+# cannot be recovered from the closing fills. The amount is always written
+# unsigned, with the credit/debit word carrying the sign — except in rows
+# written before superbulls, which are all credits and may carry a bare minus.
+SIDE_NOTE_RE = re.compile(
+    r'(Call|Put) side: (\S+) (credit|debit) \$(-?[\d,]+\.\d{2})')
 
 
 class SpreadsheetLogger:
@@ -157,9 +157,10 @@ class SpreadsheetLogger:
             strikes_str = trade.get('strikes', '')
             strikes = self._parse_strikes(strikes_str, strategy)
 
-            # For IC (Iron Condor), put strikes in notes and leave strike columns blank
-            if strategy == 'IC':
-                notes = self._ic_notes(strikes_str, trade.get('side_breakdown'))
+            # Four-leg strategies don't fit the two strike columns, so their
+            # strikes go in Notes and the columns are left blank
+            if strategy in config.FOUR_LEG_STRATEGIES:
+                notes = self._four_leg_notes(strikes_str, trade.get('side_breakdown'))
                 short_strike = ''
                 long_strike = ''
             else:
@@ -197,8 +198,8 @@ class SpreadsheetLogger:
             strikes_str = trade.get('strikes', '')
             strikes = self._parse_strikes(strikes_str, strategy)
 
-            # For IC (Iron Condor), put strikes in notes and leave strike columns blank
-            if strategy == 'IC':
+            # Four-leg strategies keep their strikes in Notes (see OPEN above)
+            if strategy in config.FOUR_LEG_STRATEGIES:
                 notes = f"Strikes: {strikes_str}"
                 short_strike = ''
                 long_strike = ''
@@ -236,17 +237,33 @@ class SpreadsheetLogger:
             net_price = trade.get('open_net_price', 0)
             roll_credit = trade.get('roll_credit', 0)
 
-            strikes = self._parse_strikes(trade.get('new_strikes', ''), trade.get('new_strategy', ''))
+            new_strategy = trade.get('new_strategy', '')
+            new_strikes = trade.get('new_strikes', '')
+            notes = f"Roll credit: ${roll_credit:.2f}"
+
+            # The rolled-into position is what this row now holds, so a
+            # four-leg one records its strikes and side split in Notes exactly
+            # as an outright open does - that is what a later close, whole or
+            # one-sided, matches against.
+            if new_strategy in config.FOUR_LEG_STRATEGIES:
+                short_strike = ''
+                long_strike = ''
+                notes = (f"{self._four_leg_notes(new_strikes, trade.get('side_breakdown'))}"
+                         f" | {notes}")
+            else:
+                strikes = self._parse_strikes(new_strikes, new_strategy)
+                short_strike = strikes['short']
+                long_strike = strikes['long']
 
             row = [
                 opening_date,           # Opening Date (datetime object)
                 closing_date,
                 underlying,
-                trade.get('new_strategy', ''),
+                new_strategy,
                 status,
                 self._parse_date(trade.get('new_expiration', '')),  # Expiration (datetime object)
-                strikes['short'],
-                strikes['long'],
+                short_strike,
+                long_strike,
                 '',
                 fees,                   # Fees (number)
                 net_price,              # Opening Net Price (number)
@@ -254,7 +271,7 @@ class SpreadsheetLogger:
                 quantity,               # Contracts (number)
                 '',
                 '',
-                f"Roll credit: ${roll_credit:.2f}"  # Keep formatted in notes
+                notes                   # Keep formatted in notes
             ]
 
         else:
@@ -427,9 +444,9 @@ class SpreadsheetLogger:
                 row_underlying_normalized = normalize_underlying(row_underlying)
 
                 # Match criteria: same underlying, strategy, expiration, strikes, and status is "Open"
-                # For IC (Iron Condor), also match on strikes in notes
+                # Four-leg strategies (IC, superbull) match on strikes in notes
                 strikes_match = False
-                if strategy == 'IC':
+                if strategy in config.FOUR_LEG_STRATEGIES:
                     # Compare strikes from notes field
                     if f"Strikes: {strikes_str}" in row_notes:
                         strikes_match = True
@@ -535,7 +552,7 @@ class SpreadsheetLogger:
 
                 # Match criteria: same underlying, strategy, expiration, strikes, opening date, and quantity
                 strikes_match = False
-                if strategy == 'IC':
+                if strategy in config.FOUR_LEG_STRATEGIES:
                     if f"Strikes: {strikes_str}" in row_notes:
                         strikes_match = True
                 else:
@@ -648,7 +665,7 @@ class SpreadsheetLogger:
 
                 # Match criteria: same underlying, strategy, expiration, strikes, and closing date
                 strikes_match = False
-                if strategy == 'IC':
+                if strategy in config.FOUR_LEG_STRATEGIES:
                     if f"Strikes: {strikes_str}" in row_notes:
                         strikes_match = True
                 else:
@@ -751,41 +768,51 @@ class SpreadsheetLogger:
             return ''
         return symbol.replace('SPXW', 'SPX').replace('RUTW', 'RUT')
 
-    def _ic_notes(self, strikes_str: str, side_breakdown: Dict = None) -> str:
+    def _four_leg_notes(self, strikes_str: str, side_breakdown: Dict = None) -> str:
         """
-        Build the Notes cell for an iron condor row.
+        Build the Notes cell for a four-leg row (iron condor or superbull).
 
-        All four strikes live in Notes because an IC doesn't fit the sheet's
-        single short/long strike columns. Recorded alongside them is what each
-        vertical was opened for, so that buying back one side later can carry
-        the other side's credit out to a row of its own.
+        All four strikes live in Notes because neither fits the sheet's single
+        short/long strike columns. Recorded alongside them is what each vertical
+        was opened for, so that closing one side later can carry the other
+        side's opening price out to a row of its own.
         """
         notes = f"Strikes: {strikes_str}"
         sides = side_breakdown or {}
         for opt_type, label in (('C', 'Call'), ('P', 'Put')):
             side = sides.get(opt_type)
             if side:
+                net_price = side['net_price']
+                effect = 'credit' if net_price >= 0 else 'debit'
                 notes += (f" | {label} side: {side['strikes']} "
-                          f"credit ${side['net_price']:,.2f}")
+                          f"{effect} ${abs(net_price):,.2f}")
         return notes
 
     @staticmethod
-    def _parse_ic_sides(notes: str) -> Dict:
-        """Read back the per-side credits recorded in an IC row's Notes"""
-        return {
-            m.group(1): {'strikes': m.group(2),
-                         'credit': float(m.group(3).replace(',', ''))}
-            for m in IC_SIDE_NOTE_RE.finditer(notes or '')
-        }
-
-    def _find_open_ic_for_side(self, trade: Dict):
+    def _parse_side_notes(notes: str) -> Dict:
         """
-        Find the iron condor row that this 2-leg close is one side of.
+        Read back the per-side opening prices recorded in a four-leg row's Notes
+
+        Returns {'Call': {'strikes': ..., 'net_price': ...}, 'Put': {...}} with
+        net price signed the way the sheet's price columns are: positive for a
+        credit received, negative for a debit paid.
+        """
+        sides = {}
+        for m in SIDE_NOTE_RE.finditer(notes or ''):
+            amount = float(m.group(4).replace(',', ''))
+            if m.group(3) == 'debit':
+                amount = -abs(amount)
+            sides[m.group(1)] = {'strikes': m.group(2), 'net_price': amount}
+        return sides
+
+    def _find_open_four_leg_for_side(self, trade: Dict):
+        """
+        Find the four-leg row that this 2-leg close is one side of.
 
         Returns a (status, detail) tuple:
           ('found', (row_num, side_label, sides, row)) - convertible
           ('already', row_num)        - this side was already carried out
-          ('no_side_data', row_num)   - the IC row predates per-side credits
+          ('no_side_data', row_num)   - the row predates per-side prices
           ('no_ic', None)             - nothing matched
         """
         underlying = self._norm_underlying(trade.get('underlying', ''))
@@ -794,25 +821,31 @@ class SpreadsheetLogger:
         if not strikes_str or not underlying:
             return ('no_ic', None)
 
+        # One vertical is two strikes. A four-leg close that reaches here is a
+        # whole position that failed to match, not a side of one - and its four
+        # strikes would otherwise look like a legacy row's strike list.
+        if strikes_str.count('/') != 1:
+            return ('no_ic', None)
+
         legacy_row = None
 
         for i, row in enumerate(self.sheet.get_all_values()):
             if i == 0 or len(row) < 16:
                 continue
-            if (row[3] != 'IC'
+            if (row[3] not in config.FOUR_LEG_STRATEGIES
                     or self._norm_underlying(row[2]) != underlying
                     or self._norm_date(row[5]) != expiration):
                 continue
 
             notes = row[15]
-            sides = self._parse_ic_sides(notes)
+            sides = self._parse_side_notes(notes)
             label = next((name for name, side in sides.items()
                           if side['strikes'] == strikes_str), None)
 
             if label is None:
-                # Older IC rows carry only the four strikes. A close whose
+                # Older four-leg rows carry only the four strikes. A close whose
                 # strikes sit inside that list is almost certainly one side,
-                # but without the recorded credit the row can't be split.
+                # but without the recorded price the row can't be split.
                 # Strikes are written calls-then-puts, each pair high to low,
                 # so a side's pair is always a contiguous substring.
                 if not sides and strikes_str in notes:
@@ -828,90 +861,100 @@ class SpreadsheetLogger:
             return ('no_side_data', legacy_row)
         return ('no_ic', None)
 
-    def _convert_ic_side_close(self, trade: Dict) -> bool:
+    def _convert_four_leg_side_close(self, trade: Dict) -> bool:
         """
-        Close one vertical of an open iron condor, carrying the other side out
-        to a row of its own.
+        Close one vertical of an open four-leg position, carrying the other side
+        out to a row of its own.
 
-        Buying back a single side is a routine IC adjustment - the tested side
-        is closed and the surviving vertical left to run. Those fills arrive as
-        an ordinary 2-leg CLOSE with no OPEN row to match, because the position
-        occupies a single 4-leg IC row.
+        Closing a single side is a routine adjustment for both strategies - an
+        iron condor's tested side is bought back and the surviving vertical left
+        to run; a superbull is often taken off one spread at a time. Those fills
+        arrive as an ordinary 2-leg CLOSE with no OPEN row to match, because the
+        position occupies a single 4-leg row.
 
-        The IC row is closed at the real side debit PLUS the surviving side's
-        opening credit. Carrying that credit out is what keeps the arithmetic
-        exact: the IC row then realises precisely the closed side's P&L, and
-        the surviving vertical opens its own row still holding the premium it
-        owes back, so the two rows always sum to the real total. It also leaves
-        the survivor as an ordinary spread row, which means its eventual close
-        matches automatically instead of erroring again.
+        The four-leg row is closed at the real side close price PLUS the
+        surviving side's opening price. Carrying that price out is what keeps
+        the arithmetic exact: the row then realises precisely the closed side's
+        P&L, and the surviving vertical opens its own row still holding the
+        credit it owes back (or the debit it has already paid), so the two rows
+        always sum to the real total. It also leaves the survivor as an ordinary
+        spread row, which means its eventual close matches automatically instead
+        of erroring again.
 
-        Returns a (handled, ok) tuple. 'handled' says this close belongs to an
-        IC and the caller should not fall back to its generic no-match error -
-        any error worth reporting has already been logged here.
+        Returns a (handled, ok) tuple. 'handled' says this close belongs to a
+        four-leg position and the caller should not fall back to its generic
+        no-match error - any error worth reporting has already been logged here.
         """
-        status, detail = self._find_open_ic_for_side(trade)
+        status, detail = self._find_open_four_leg_for_side(trade)
 
         if status == 'already':
-            print(f"⊘ Skipped duplicate IC side close {trade.get('underlying')} "
+            print(f"⊘ Skipped duplicate side close {trade.get('underlying')} "
                   f"{trade.get('strikes')} (already carried out at row {detail})")
             return (True, True)
 
         if status == 'no_side_data':
             self.log_error(trade,
-                           f"Looks like one side of the IC at row {detail}, but "
-                           "that row has no per-side credit recorded - split by hand")
-            print(f"✗ IC at row {detail} has no recorded per-side credit "
+                           f"Looks like one side of the position at row {detail}, "
+                           "but that row has no per-side price recorded - split by hand")
+            print(f"✗ Four-leg row {detail} has no recorded per-side price "
                   f"- logged to Import Errors")
             return (True, False)
 
         if status != 'found':
             return (False, False)
 
-        ic_row_num, label, sides, ic_row = detail
+        parent_row_num, label, sides, parent_row = detail
+        parent_strategy = parent_row[3]
         survivor_label = 'Put' if label == 'Call' else 'Call'
         survivor = sides.get(survivor_label)
         if not survivor:
             return (False, False)
 
         close_date = trade.get('trade_date', '')
-        quantity = int(float(ic_row[12] or 0))
+        quantity = int(float(parent_row[12] or 0))
 
         # Closing only part of a side would leave some of that vertical still
         # open, which a whole-row conversion cannot represent. Surface it
-        # instead of silently closing the IC and inventing a full-size survivor.
+        # instead of silently closing the row and inventing a full-size survivor.
         close_qty = trade.get('quantity', 0)
         if close_qty != quantity:
             self.log_error(trade,
-                           f"Partial IC side close: IC at row {ic_row_num} holds "
-                           f"{quantity} contracts, closing {close_qty} - split by hand")
-            print(f"✗ Partial IC side close for {trade.get('underlying')} "
-                  f"(row {ic_row_num} holds {quantity}, closing {close_qty}) "
-                  f"- logged to Import Errors")
+                           f"Partial side close: {parent_strategy} at row "
+                           f"{parent_row_num} holds {quantity} contracts, "
+                           f"closing {close_qty} - split by hand")
+            print(f"✗ Partial {parent_strategy} side close for "
+                  f"{trade.get('underlying')} (row {parent_row_num} holds "
+                  f"{quantity}, closing {close_qty}) - logged to Import Errors")
             return (True, False)
 
-        # Fees are informational - P&L uses columns K and L only - so the IC's
+        # Fees are informational - P&L uses columns K and L only - so the
         # opening fees simply split evenly between the two verticals rather
         # than being re-derived per leg.
-        side_fees = self._parse_money(ic_row[9]) / 2
+        side_fees = self._parse_money(parent_row[9]) / 2
 
-        # 1. Close the IC row, carrying the surviving side's credit out with it.
-        carried = survivor['credit']
+        # 1. Close the four-leg row, carrying the surviving side's opening price
+        #    out with it.
+        carried = survivor['net_price']
         closing_trade = dict(trade)
         closing_trade['net_price'] = trade.get('net_price', 0) - carried
         if not self.update_close_trade(
-                ic_row_num, closing_trade,
+                parent_row_num, closing_trade,
                 fees_override=side_fees + trade.get('fees', 0)):
-            self.log_error(trade, f"Failed to close IC row {ic_row_num} for side close")
+            self.log_error(trade, f"Failed to close {parent_strategy} row "
+                                  f"{parent_row_num} for side close")
             return (True, False)
 
         # 2. Open the surviving vertical as a position in its own right. It
-        #    keeps the IC's entry date, because that is when the risk went on.
+        #    keeps the four-leg row's entry date, because that is when the risk
+        #    went on. Which vertical it is depends on the parent strategy: a
+        #    superbull's call side is long, an iron condor's is short.
+        side_strategy = config.FOUR_LEG_SIDE_STRATEGY.get(
+            parent_strategy, config.FOUR_LEG_SIDE_STRATEGY['IC'])
         survivor_trade = {
             'action': 'OPEN',
             'underlying': trade.get('underlying', ''),
-            'strategy': IC_SIDE_STRATEGY[survivor_label],
-            'trade_date': ic_row[0],
+            'strategy': side_strategy[survivor_label],
+            'trade_date': parent_row[0],
             'expiration': trade.get('expiration', ''),
             'strikes': survivor['strikes'],
             'quantity': quantity,
@@ -919,20 +962,20 @@ class SpreadsheetLogger:
             'fees': side_fees,
         }
         row = self.format_trade_row(survivor_trade)
-        row[15] = (f"{survivor_label} side of IC (row {ic_row_num}), "
-                   f"carried out {close_date}")
+        row[15] = (f"{survivor_label} side of {parent_strategy} "
+                   f"(row {parent_row_num}), carried out {close_date}")
         survivor_row_num = self._append_row_at_column_a(row)
         self.format_new_row(survivor_row_num)
 
-        # 3. Mark the IC row, so a re-run inside the lookback window recognises
-        #    the conversion instead of applying it a second time.
+        # 3. Mark the four-leg row, so a re-run inside the lookback window
+        #    recognises the conversion instead of applying it a second time.
         self.sheet.update_acell(
-            f'P{ic_row_num}',
-            f"{ic_row[15]} | {label} side closed {close_date} "
+            f'P{parent_row_num}',
+            f"{parent_row[15]} | {label} side closed {close_date} "
             f"-> row {survivor_row_num}")
 
-        print(f"⚙ IC row {ic_row_num}: closed {label.lower()} side, carried "
-              f"{survivor_label.lower()} side {survivor['strikes']} "
+        print(f"⚙ {parent_strategy} row {parent_row_num}: closed {label.lower()} "
+              f"side, carried {survivor_label.lower()} side {survivor['strikes']} "
               f"(${carried:,.2f}) out to row {survivor_row_num}")
         return (True, True)
 
@@ -1121,10 +1164,10 @@ class SpreadsheetLogger:
                         self.clear_error(trade)
                         return True  # Return success since it's already closed
 
-                    # A 2-leg close with no open row of its own may be one
-                    # side of an iron condor being bought back, which is a
-                    # routine adjustment rather than an error.
-                    handled, ok = self._convert_ic_side_close(trade)
+                    # A 2-leg close with no open row of its own may be one side
+                    # of a four-leg position (iron condor or superbull) being
+                    # closed, which is a routine adjustment rather than an error.
+                    handled, ok = self._convert_four_leg_side_close(trade)
                     if handled:
                         if ok:
                             self.clear_error(trade)
@@ -1812,11 +1855,18 @@ class SpreadsheetLogger:
         # Group CLOSE trades by position key
         grouped = defaultdict(list)
         for trade in close_trades:
-            # Normalize strikes for comparison
-            strikes = self._parse_strikes(trade.get('strikes', ''), trade.get('strategy', ''))
+            # Normalize strikes for comparison. Four-leg strategies have no
+            # short/long pair to normalize to — parsing four strikes yields two
+            # blanks, which would fold two different condors on the same
+            # underlying and expiration into one — so they key on the raw list.
+            strategy = trade.get('strategy', '')
+            if strategy in config.FOUR_LEG_STRATEGIES:
+                strikes = {'short': trade.get('strikes', ''), 'long': ''}
+            else:
+                strikes = self._parse_strikes(trade.get('strikes', ''), strategy)
             key = (
                 trade.get('underlying', ''),
-                trade.get('strategy', ''),
+                strategy,
                 trade.get('expiration', ''),
                 strikes['short'],
                 strikes['long'],

@@ -5,7 +5,8 @@ Automated trade logging system that syncs Tastytrade transactions to Google Shee
 ## Features
 
 - ✅ Fetches transactions from Tastytrade API
-- ✅ Classifies option strategies (spreads, CSPs, covered calls)
+- ✅ Classifies option strategies (spreads, CSPs, covered calls, iron
+  condors, superbulls)
 - ✅ Detects and links rolls (including multi-leg spread rolls)
 - ✅ Matches closing trades to open positions
 - ✅ Handles partial closes
@@ -108,6 +109,37 @@ with the literal exit price. `Total P/L` is always `=(G{r}-F{r})*E{r}`.
   entry date and entry price already exists (including rows entered by hand); a
   sale is a duplicate if closed rows at that ticker, exit date and exit price
   already total the sale.
+
+### Options Log — four-leg positions (iron condors, superbulls)
+
+Both strategies pair a call vertical with a put vertical and are held as one
+position, so they occupy **one row** with all four strikes in Notes — the sheet
+has room for a single short/long pair. What separates them is the call side:
+
+| | Call side | Put side | Opens for |
+|---|---|---|---|
+| `IC` | Bear call spread (short below long) | Bull put spread | a credit |
+| `Superbull` | Bull call spread (long below short) | Bull put spread | either sign |
+
+A superbull's call debit and put credit net out to a credit or a debit
+depending on the strikes, so its Opening Net Price can be negative. P&L is
+`open + close` either way, so nothing downstream cares about the sign.
+
+**Exiting one side.** Either spread can be closed on its own, leaving the other
+running. Those fills arrive as a plain 2-leg close with no open row to match, so
+the logger converts the row instead:
+
+1. The four-leg row is closed at the real side close price **plus** the
+   surviving side's opening price, so it realises exactly the closed side's P&L.
+2. The surviving vertical is appended as an ordinary spread row (keeping the
+   four-leg row's entry date) holding the opening price carried out of it, so
+   its own eventual close matches with no special handling.
+
+The two rows always sum to the real total. This only works because each side's
+opening price is recorded in Notes when the position is opened — it can't be
+re-derived from the closing fills. Rows predating that, and closes that cover
+only part of a side, go to Import Errors rather than being guessed at;
+`backfill_ic_side_credits.py` fills in the older rows from their opening orders.
 
 ## Project Structure
 

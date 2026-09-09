@@ -8,6 +8,15 @@ from collections import defaultdict
 import config
 
 
+# Four-leg orders are told apart by their call vertical: a bear call spread
+# above a bull put spread is an iron condor, a bull call spread above one is a
+# superbull. Derived from the side table so the two stay in step.
+FOUR_LEG_BY_CALL_SIDE = {
+    sides['Call']: strategy
+    for strategy, sides in config.FOUR_LEG_SIDE_STRATEGY.items()
+}
+
+
 class TransactionProcessor:
     """Process and classify option transactions"""
 
@@ -166,12 +175,12 @@ class TransactionProcessor:
             'notes': ''
         }
 
-        # An iron condor is routinely adjusted one side at a time, which leaves
-        # the surviving vertical needing its own share of the opening credit.
-        # That split can't be recovered from the closing fills later, so record
-        # it now, while all four legs are in hand.
-        if trade['strategy'] == 'IC':
-            trade['side_breakdown'] = self._split_ic_sides(legs)
+        # A four-leg position is routinely exited one side at a time, which
+        # leaves the surviving vertical needing its own share of the opening
+        # price. That split can't be recovered from the closing fills later, so
+        # record it now, while all four legs are in hand.
+        if trade['strategy'] in config.FOUR_LEG_STRATEGIES:
+            trade['side_breakdown'] = self._split_vertical_sides(legs)
 
         return trade
 
@@ -292,7 +301,7 @@ class TransactionProcessor:
         old_strikes = self._get_strikes(closing_legs)
         new_strikes = self._get_strikes(opening_legs)
 
-        return {
+        roll = {
             'action': 'ROLL',
             'order_id': order_id,
             'closing_legs': closing_legs,
@@ -312,6 +321,14 @@ class TransactionProcessor:
             'fees': self._calculate_fees(closing_legs + opening_legs),
             'notes': f"Rolled {old_strikes} → {new_strikes}. Roll credit: ${roll_credit:.2f}"
         }
+
+        # The new position is what the row goes on to represent, so a four-leg
+        # one needs its side split recorded here just as an outright open does
+        # - otherwise a later side-only exit has nothing to divide.
+        if roll['new_strategy'] in config.FOUR_LEG_STRATEGIES:
+            roll['side_breakdown'] = self._split_vertical_sides(opening_legs)
+
+        return roll
 
     def _get_underlying(self, leg: Dict) -> str:
         """Extract underlying symbol from transaction"""
@@ -463,14 +480,12 @@ class TransactionProcessor:
             return symbol[self.OCC_TYPE_INDEX]
         return ''
 
-    def _split_ic_sides(self, legs: List[Dict]) -> Dict:
+    def _split_by_option_type(self, legs: List[Dict]) -> Dict:
         """
-        Break an iron condor's four legs into its call and put verticals.
+        Group four legs into {'C': [...], 'P': [...]}.
 
-        Returns {'C': {...}, 'P': {...}} carrying each side's strikes, net
-        credit and fees, or {} if the legs don't split cleanly into two calls
-        and two puts - in which case the IC is logged as before, just without
-        a recorded split.
+        Returns {} unless they split cleanly into two calls and two puts, which
+        is the shape every four-leg strategy here is built from.
         """
         sides = {'C': [], 'P': []}
         for leg in legs:
@@ -480,6 +495,42 @@ class TransactionProcessor:
             sides[opt_type].append(leg)
 
         if len(sides['C']) != 2 or len(sides['P']) != 2:
+            return {}
+
+        return sides
+
+    def _classify_four_leg(self, legs: List[Dict], closing: bool = False) -> str:
+        """
+        Name a four-leg order from the two verticals it is built out of.
+
+        Both strategies pair a bull put spread with a call vertical; the call
+        side's direction is the whole difference. Anything that doesn't split
+        into two recognisable verticals stays 'IC', which is what every four-leg
+        order was called before superbulls existed.
+        """
+        sides = self._split_by_option_type(legs)
+        if not sides:
+            return 'IC'
+
+        classify = (self._classify_closing_strategy if closing
+                    else self._classify_strategy)
+        if classify(sides['P']) != 'Bull Put Spread':
+            return 'IC'
+
+        return FOUR_LEG_BY_CALL_SIDE.get(classify(sides['C']), 'IC')
+
+    def _split_vertical_sides(self, legs: List[Dict]) -> Dict:
+        """
+        Break a four-leg position into its call and put verticals.
+
+        Returns {'C': {...}, 'P': {...}} carrying each side's strikes, net
+        price and fees, or {} if the legs don't split into two calls and two
+        puts - in which case the position is logged as before, just without a
+        recorded split. Each side's net price is signed: a credit spread's is
+        positive, a superbull's call debit spread negative.
+        """
+        sides = self._split_by_option_type(legs)
+        if not sides:
             return {}
 
         return {
@@ -620,8 +671,8 @@ class TransactionProcessor:
                     return 'Bear Call Spread'
 
         elif num_legs == 4:
-            # 4-leg spread - classify as IC (Iron Condor)
-            return 'IC'
+            # Iron condor or superbull, told apart by the call vertical
+            return self._classify_four_leg(legs)
 
         return 'Unknown'
 
@@ -717,8 +768,8 @@ class TransactionProcessor:
                     return 'Bull Call Spread'
 
         elif num_legs == 4:
-            # 4-leg spread - classify as IC (Iron Condor)
-            return 'IC'
+            # Iron condor or superbull, told apart by the call vertical
+            return self._classify_four_leg(legs, closing=True)
 
         return 'Unknown'
 

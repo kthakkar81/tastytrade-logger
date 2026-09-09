@@ -72,7 +72,7 @@ def trades():
 def ic_notes(trades):
     """The Notes cell the logger writes when this IC is opened."""
     open_trade, _ = trades
-    return SpreadsheetLogger('stub')._ic_notes(open_trade['strikes'],
+    return SpreadsheetLogger('stub')._four_leg_notes(open_trade['strikes'],
                                                open_trade['side_breakdown'])
 
 
@@ -101,16 +101,16 @@ def test_side_breakdown_sums_to_the_ic_credit(trades):
 def test_notes_round_trip(ic_notes):
     assert ic_notes.startswith(f"Strikes: {FOUR_STRIKES}")
 
-    sides = SpreadsheetLogger._parse_ic_sides(ic_notes)
-    assert sides['Call'] == {'strikes': '$150.00/$145.00', 'credit': 115.50}
-    assert sides['Put'] == {'strikes': '$115.00/$110.00', 'credit': 185.50}
+    sides = SpreadsheetLogger._parse_side_notes(ic_notes)
+    assert sides['Call'] == {'strikes': '$150.00/$145.00', 'net_price': 115.50}
+    assert sides['Put'] == {'strikes': '$115.00/$110.00', 'net_price': 185.50}
 
 
 def test_closing_the_call_side_realises_only_that_side(trades, ic_notes):
     _, close = trades
     logger = make_logger(ic_notes)
 
-    assert logger._convert_ic_side_close(close) == (True, True)
+    assert logger._convert_four_leg_side_close(close) == (True, True)
 
     ic_row = logger.sheet.rows[1]
     assert ic_row[4] == 'Closed'
@@ -125,7 +125,7 @@ def test_closing_the_call_side_realises_only_that_side(trades, ic_notes):
 def test_surviving_side_becomes_an_ordinary_spread_row(trades, ic_notes):
     _, close = trades
     logger = make_logger(ic_notes)
-    logger._convert_ic_side_close(close)
+    logger._convert_four_leg_side_close(close)
 
     survivor = logger.sheet.rows[2]
     assert survivor[2:8] == ['NOW', 'Bull Put Spread', 'Open', '9/18/2026',
@@ -139,7 +139,7 @@ def test_surviving_side_becomes_an_ordinary_spread_row(trades, ic_notes):
 def test_the_two_rows_sum_to_the_real_total(trades, ic_notes):
     open_trade, close = trades
     logger = make_logger(ic_notes)
-    logger._convert_ic_side_close(close)
+    logger._convert_four_leg_side_close(close)
 
     realised = float(logger.sheet.rows[1][13])
     carried = float(logger.sheet.rows[2][10])
@@ -150,9 +150,9 @@ def test_the_two_rows_sum_to_the_real_total(trades, ic_notes):
 def test_rerun_does_not_convert_twice(trades, ic_notes):
     _, close = trades
     logger = make_logger(ic_notes)
-    logger._convert_ic_side_close(close)
+    logger._convert_four_leg_side_close(close)
 
-    assert logger._convert_ic_side_close(close) == (True, True)
+    assert logger._convert_four_leg_side_close(close) == (True, True)
     assert len(logger.sheet.rows) == 3, 'appended a second survivor row'
 
 
@@ -161,7 +161,7 @@ def test_unrelated_close_is_left_to_the_normal_path(trades, ic_notes):
     logger = make_logger(ic_notes)
 
     other = dict(close, strikes='$200.00/$195.00')
-    assert logger._convert_ic_side_close(other) == (False, False)
+    assert logger._convert_four_leg_side_close(other) == (False, False)
     assert logger.errors == []
 
 
@@ -170,10 +170,10 @@ def test_partial_side_close_refuses_rather_than_guessing(trades, ic_notes):
     _, close = trades
     logger = make_logger(ic_notes)
 
-    assert logger._convert_ic_side_close(dict(close, quantity=1)) == (True, False)
+    assert logger._convert_four_leg_side_close(dict(close, quantity=1)) == (True, False)
     assert logger.sheet.rows[1][4] == 'Open'
     assert len(logger.sheet.rows) == 2
-    assert 'Partial IC side close' in logger.errors[0]
+    assert 'Partial side close' in logger.errors[0]
 
 
 def test_ic_row_without_recorded_credits_refuses(trades):
@@ -181,6 +181,6 @@ def test_ic_row_without_recorded_credits_refuses(trades):
     _, close = trades
     logger = make_logger(f"Strikes: {FOUR_STRIKES}")
 
-    assert logger._convert_ic_side_close(close) == (True, False)
+    assert logger._convert_four_leg_side_close(close) == (True, False)
     assert logger.sheet.rows[1][4] == 'Open'
-    assert 'no per-side credit' in logger.errors[0]
+    assert 'no per-side price' in logger.errors[0]

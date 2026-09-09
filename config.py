@@ -35,6 +35,25 @@ STOCK_LOG_HEADER = ['Entry Date', 'Exit Date', 'Ticker', 'Status', 'Qty',
 # already entered by hand, and there is nowhere to put a dividend.
 EQUITY_RECEIVE_DELIVER_SUBTYPES = {'Assignment', 'Exercise'}
 
+# Four-leg strategies: a call vertical and a put vertical held as one position
+# and logged on one row, with all four strikes in Notes because the sheet has
+# room for a single short/long pair.
+#
+# An iron condor's call side is a credit spread (short strike below long), so
+# the whole position opens for a credit. A superbull's call side is a debit
+# spread (long strike below short), so its bull put credit and bull call debit
+# net out to either sign — the opening net price carries that sign, and the
+# sheet's P&L (open + close) works out the same way regardless.
+FOUR_LEG_STRATEGIES = ('IC', 'Superbull')
+
+# What each side of a four-leg position is once it stands on its own, which is
+# what a side-only exit leaves behind. Also the classifier's lookup, read
+# backwards: the call vertical is what tells the two strategies apart.
+FOUR_LEG_SIDE_STRATEGY = {
+    'IC': {'Call': 'Bear Call Spread', 'Put': 'Bull Put Spread'},
+    'Superbull': {'Call': 'Bull Call Spread', 'Put': 'Bull Put Spread'},
+}
+
 # Transaction Classification
 OPTION_STRATEGIES = {
     'bull_put_spread': {

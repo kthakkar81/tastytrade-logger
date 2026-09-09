@@ -26,3 +26,8 @@ env/
 # OS
 .DS_Store
 logs/
+
+# Synthetic test fixtures, tracked so the suite runs on a clean clone. The rest
+# of evals/inputs/ is real fetched account data and stays ignored by *.json.
+!evals/inputs/ic_side_close_now.json
+!evals/inputs/superbull_now.json
