@@ -55,7 +55,7 @@ def make_logger(notes, contracts='2'):
     logger = SpreadsheetLogger('stub')
     logger.sheet = StubSheet([
         HEADER,
-        ['8/25/2026', '', 'NOW', 'Superbull', 'Open', '9/18/2026', '', '', '',
+        ['8/25/2026', '', 'NOW', 'Super Bull', 'Open', '9/18/2026', '', '', '',
          '$8.96', '-$198.96', '', contracts, '', '', notes],
     ])
     logger.errors = []
@@ -66,7 +66,7 @@ def make_logger(notes, contracts='2'):
 def test_a_long_call_side_makes_it_a_superbull_not_a_condor(trades):
     """The call vertical is the whole difference: long below short, not short
     below long."""
-    assert trades['open']['strategy'] == 'Superbull'
+    assert trades['open']['strategy'] == 'Super Bull'
     assert trades['open']['strikes'] == FOUR_STRIKES
 
 
@@ -99,7 +99,7 @@ def test_closing_all_four_legs_matches_the_open_row(trades, notes):
     """A whole exit is an ordinary CLOSE - it just matches on the strikes in
     Notes, the way four-leg rows always have."""
     full_exit = trades['full_exit']
-    assert full_exit['strategy'] == 'Superbull'
+    assert full_exit['strategy'] == 'Super Bull'
 
     logger = make_logger(notes)
     assert logger.find_all_open_trades(full_exit) == [2]
@@ -185,7 +185,7 @@ def test_partial_side_close_refuses_rather_than_guessing(trades, notes):
     assert logger._convert_four_leg_side_close(partial) == (True, False)
     assert logger.sheet.rows[1][4] == 'Open'
     assert len(logger.sheet.rows) == 2
-    assert 'Partial side close: Superbull' in logger.errors[0]
+    assert 'Partial side close: Super Bull' in logger.errors[0]
 
 
 def test_the_open_row_keeps_all_four_strikes_in_notes(trades):
@@ -193,7 +193,7 @@ def test_the_open_row_keeps_all_four_strikes_in_notes(trades):
     opening net price carries the debit's sign into the P&L column."""
     row = SpreadsheetLogger('stub').format_trade_row(trades['open'])
 
-    assert row[3] == 'Superbull'
+    assert row[3] == 'Super Bull'
     assert (row[6], row[7]) == ('', '')
     assert row[10] == pytest.approx(-198.96, abs=0.01)
     assert row[15].startswith(f"Strikes: {FOUR_STRIKES}")
@@ -206,7 +206,7 @@ def test_a_rolled_superbull_still_records_its_strikes(trades):
     roll = {
         'action': 'ROLL',
         'underlying': 'NOW',
-        'new_strategy': 'Superbull',
+        'new_strategy': 'Super Bull',
         'new_expiration': '10/16/2026',
         'new_strikes': trades['open']['strikes'],
         'side_breakdown': trades['open']['side_breakdown'],

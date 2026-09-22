@@ -44,14 +44,18 @@ EQUITY_RECEIVE_DELIVER_SUBTYPES = {'Assignment', 'Exercise'}
 # spread (long strike below short), so its bull put credit and bull call debit
 # net out to either sign — the opening net price carries that sign, and the
 # sheet's P&L (open + close) works out the same way regardless.
-FOUR_LEG_STRATEGIES = ('IC', 'Superbull')
+#
+# The labels must be exactly the sheet's Strategy Type validation values:
+# rows are matched by comparing this string to the cell, so a near-miss
+# ('Superbull' vs 'Super Bull') silently orphans every open row.
+FOUR_LEG_STRATEGIES = ('IC', 'Super Bull')
 
 # What each side of a four-leg position is once it stands on its own, which is
 # what a side-only exit leaves behind. Also the classifier's lookup, read
 # backwards: the call vertical is what tells the two strategies apart.
 FOUR_LEG_SIDE_STRATEGY = {
     'IC': {'Call': 'Bear Call Spread', 'Put': 'Bull Put Spread'},
-    'Superbull': {'Call': 'Bull Call Spread', 'Put': 'Bull Put Spread'},
+    'Super Bull': {'Call': 'Bull Call Spread', 'Put': 'Bull Put Spread'},
 }
 
 # Transaction Classification

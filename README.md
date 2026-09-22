@@ -119,7 +119,11 @@ has room for a single short/long pair. What separates them is the call side:
 | | Call side | Put side | Opens for |
 |---|---|---|---|
 | `IC` | Bear call spread (short below long) | Bull put spread | a credit |
-| `Superbull` | Bull call spread (long below short) | Bull put spread | either sign |
+| `Super Bull` | Bull call spread (long below short) | Bull put spread | either sign |
+
+These are the Strategy Type cell's own validation values, spelling and
+all: rows are matched by comparing the label the logger computes to the
+cell, so the two must stay identical.
 
 A superbull's call debit and put credit net out to a credit or a debit
 depending on the strikes, so its Opening Net Price can be negative. P&L is
