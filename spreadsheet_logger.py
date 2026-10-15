@@ -22,14 +22,16 @@ import config
 SIDE_NOTE_RE = re.compile(
     r'(Call|Put) side: (\S+) (credit|debit) \$(-?[\d,]+\.\d{2})')
 
-# Per-leg opening prices from the same Notes cell, e.g.
-#   "Legs: $46.00C credit $75.51, $45.00C debit $108.48, ..."
+# What each leg of a multi-leg position was opened for, recorded in its own
+# column (config.OPTIONS_LOG_LEG_COL) as e.g.
+#   "$46.00C credit $75.51 fee $4.49, $45.00C debit $108.48 fee $4.48"
 # The per-side prices above cover a position exited one whole side at a time;
-# these cover one legged out of, where a single leg is left standing and needs
-# its own share of the opening price. Rows opened before this was recorded have
-# no Legs section, and such a close has to be split by hand.
-LEG_NOTE_RE = re.compile(
-    r'\$([\d,]+\.\d{2})([CP]) (credit|debit) \$(-?[\d,]+\.\d{2})')
+# these cover one legged out of, where each closing order has to be reconciled
+# against just the legs it covers. Rows opened before this was recorded have an
+# empty cell, and such a close has to be split by hand.
+LEG_RE = re.compile(
+    r'\$([\d,]+\.\d{2})([CP]) (credit|debit) \$(-?[\d,]+\.\d{2})'
+    r'(?: fee \$(-?[\d,]+\.\d{2}))?')
 
 
 class SpreadsheetLogger:
@@ -196,6 +198,14 @@ class SpreadsheetLogger:
                 notes                   # Notes/Setup
             ]
 
+            # What each leg was opened for, in its own column past the sheet's
+            # own. Written now because a position legged out of later needs it
+            # and the closing fills can't supply it.
+            leg_cell = self.format_leg_cell(trade.get('side_breakdown'),
+                                            trade.get('leg_breakdown'))
+            if leg_cell:
+                row.append(leg_cell)
+
         elif action == 'CLOSE':
             # Closing transaction - log as separate row for now
             # TODO: Could enhance to find and update matching open row
@@ -282,6 +292,13 @@ class SpreadsheetLogger:
                 '',
                 notes                   # Keep formatted in notes
             ]
+
+            # The rolled-into position can be legged out of like any other, so
+            # it records its per-leg prices too (see the OPEN branch).
+            leg_cell = self.format_leg_cell(trade.get('side_breakdown'),
+                                            trade.get('leg_breakdown'))
+            if leg_cell:
+                row.append(leg_cell)
 
         else:
             # Unknown action
@@ -793,19 +810,6 @@ class SpreadsheetLogger:
                 notes += (f" | {label} side: {side['strikes']} "
                           f"{effect} ${abs(net_price):,.2f}")
 
-        # Per-leg prices too, because a position can be legged out of rather
-        # than exited a side at a time, leaving one leg on its own. Only the
-        # opening order knows what that leg cost.
-        leg_notes = []
-        for opt_type in ('C', 'P'):
-            for leg in (sides.get(opt_type) or {}).get('legs', []):
-                price = leg['net_price']
-                leg_notes.append(
-                    f"${leg['strike']:,.2f}{leg['type']} "
-                    f"{'credit' if price >= 0 else 'debit'} ${abs(price):,.2f}")
-        if leg_notes:
-            notes += " | Legs: " + ", ".join(leg_notes)
-
         return notes
 
     @staticmethod
@@ -840,40 +844,76 @@ class SpreadsheetLogger:
         return sides
 
     @staticmethod
-    def _parse_leg_notes(notes: str) -> Dict:
+    def format_leg_cell(side_breakdown: Dict = None, legs: List = None) -> str:
         """
-        Read back the per-leg opening prices recorded in a four-leg row's Notes
+        Build the leg column's contents for a multi-leg position being opened.
 
-        Returns {(strike, 'C'|'P'): net_price} with the price signed the way
-        the sheet's price columns are - positive for a credit received,
-        negative for a debit paid. Empty for a row opened before per-leg prices
-        were recorded.
+        Takes either a flat list of legs or a four-leg side_breakdown to read
+        them out of, so one format covers verticals and four-leggers alike. A
+        four-leg trade carries both; the flat list is the same legs, so taking
+        it alone is what keeps them from being listed twice.
         """
-        _, _, tail = (notes or '').partition('Legs:')
-        if not tail:
-            return {}
+        flat = list(legs or [])
+        if not flat:
+            for opt_type in ('C', 'P'):
+                flat.extend((side_breakdown or {}).get(opt_type, {}).get('legs', []))
 
+        parts = []
+        for leg in flat:
+            price = leg['net_price']
+            parts.append(
+                f"${leg['strike']:,.2f}{leg['type']} "
+                f"{'credit' if price >= 0 else 'debit'} ${abs(price):,.2f} "
+                f"fee ${leg.get('fees', 0):,.2f}")
+        return ", ".join(parts)
+
+    @staticmethod
+    def _parse_leg_cell(cell: str) -> Dict:
+        """
+        Read back the per-leg opening prices from the leg column.
+
+        Returns {(strike, 'C'|'P'): {'net_price': ..., 'fees': ...}} with the
+        price signed the way the sheet's price columns are - positive for a
+        credit received, negative for a debit paid. Empty for a row opened
+        before per-leg prices were recorded, which is what tells the caller
+        such a close has to be split by hand.
+        """
         legs = {}
-        for m in LEG_NOTE_RE.finditer(tail):
+        for m in LEG_RE.finditer(cell or ''):
             amount = float(m.group(4).replace(',', ''))
             if m.group(3) == 'debit':
                 amount = -abs(amount)
-            legs[(float(m.group(1).replace(',', '')), m.group(2))] = amount
+            legs[(float(m.group(1).replace(',', '')), m.group(2))] = {
+                'net_price': amount,
+                'fees': float((m.group(5) or '0').replace(',', '')),
+            }
         return legs
 
-    def _find_open_four_leg_for_orphan(self, trade: Dict):
+    def _row_strikes(self, row: List) -> set:
         """
-        Find the four-leg row that this partial close takes most of the legs of.
+        Every strike a row holds, however the row records them.
 
-        A position legged out of arrives as a close covering some of its legs,
-        with the rest left open - three legs here, the fourth still running.
-        The row is matched by its legs rather than its strategy name or strike
-        string: whichever of the row's four legs this close doesn't mention is
-        the one that survives.
+        Two-leg rows use the short/long strike columns; four-leg rows have no
+        room for four, so they list them in Notes instead.
+        """
+        strikes = {s.strip() for s in (row[6], row[7]) if s.strip()}
+        strikes |= {s.strip() for s in self._notes_strikes(row[15]).split('/')
+                    if s.strip()}
+        return strikes
+
+    def _find_open_row_for_legged_out_close(self, trade: Dict):
+        """
+        Find the open row that this close takes only some of the legs of.
+
+        A position legged out of comes off in whatever groups the orders
+        happened to fill in, so a closing order covers a subset of the row's
+        legs and the rest keep running. The row is matched on its legs, not on
+        its strategy name: whichever of its legs this close doesn't mention are
+        the ones that survive.
 
         Returns a (status, detail) tuple:
-          ('found', (row_num, row, orphans))  - convertible; orphans is
-                                                {(strike, type): open_price}
+          ('found', (row_num, row, legs))  - convertible; legs is
+                                             {(strike, type): {net_price, fees}}
           ('already', row_num)      - already converted on an earlier run
           ('no_leg_data', row_num)  - row predates per-leg prices
           ('no_match', None)        - nothing matched
@@ -885,32 +925,30 @@ class SpreadsheetLogger:
         if not underlying or not closed:
             return ('no_match', None)
 
+        closed_strikes = {f"${strike:,.2f}" for strike, _ in closed}
+        leg_idx = config.OPTIONS_LOG_LEG_COL_INDEX
         no_leg_data = None
 
         for i, row in enumerate(self.sheet.get_all_values()):
             if i == 0 or len(row) < 16:
                 continue
-            if (row[3] not in config.FOUR_LEG_STRATEGIES
-                    or self._norm_underlying(row[2]) != underlying
+            if (self._norm_underlying(row[2]) != underlying
                     or self._norm_date(row[5]) != expiration):
                 continue
 
-            notes = row[15]
-
-            # Every strike this close covers has to be one of the row's, which
-            # is checkable from the strike list alone - the per-leg prices
-            # below may not be there.
-            if not {f"${strike:,.2f}" for strike, _ in closed} <= set(
-                    self._notes_strikes(notes).split('/')):
+            # Every strike this close covers has to be one the row holds.
+            # Checked off the row's own columns, because the per-leg prices
+            # read below may not be there at all.
+            if not closed_strikes <= self._row_strikes(row):
                 continue
 
             # Already carried out, on an earlier run or by hand. Recognised
             # before the per-leg prices are read, because a row repaired by
             # hand carries the marker without ever having had them.
-            if 'legged out' in notes:
+            if 'legged out' in row[15]:
                 return ('already', i + 1)
 
-            legs = self._parse_leg_notes(notes)
+            legs = self._parse_leg_cell(row[leg_idx] if len(row) > leg_idx else '')
             if not legs:
                 # The right row, but opened before per-leg prices were
                 # recorded. Say so rather than reporting nothing matched.
@@ -918,13 +956,12 @@ class SpreadsheetLogger:
                     no_leg_data = i + 1
                 continue
 
-            # At least one of the row's legs must be left over to carry out.
+            # A strict subset: some of the row's legs must be left over. An
+            # exact match is a whole-position close and not this path's job.
             if not closed < set(legs):
                 continue
 
-            orphans = {leg: price for leg, price in legs.items()
-                       if leg not in closed}
-            return ('found', (i + 1, row, orphans))
+            return ('found', (i + 1, row, legs))
 
         if no_leg_data:
             return ('no_leg_data', no_leg_data)
@@ -1104,26 +1141,43 @@ class SpreadsheetLogger:
               f"(${carried:,.2f}) out to row {survivor_row_num}")
         return (True, True)
 
-    def _convert_four_leg_orphan_close(self, trade: Dict):
+    @staticmethod
+    def _leg_strategy(opt_type: str, net_price: float) -> str:
         """
-        Close most of a four-leg position, carrying the leftover leg(s) out.
+        The sheet's name for a single option leg standing on its own.
 
-        The sibling of _convert_four_leg_side_close, for a position legged out
-        of rather than exited a side at a time: the close covers three of the
-        four legs and the fourth is still running. The arithmetic is the same
-        idea - the four-leg row is closed at the real close price less the
-        surviving leg's opening price, so it realises exactly the closed legs'
-        P&L, and the survivor opens its own row still holding what it cost. The
-        two rows always sum to the real total.
+        A credit received means the leg was sold, a debit paid that it was
+        bought - the same four names the log already uses for one-leg rows.
+        """
+        if net_price >= 0:
+            return 'CSP' if opt_type == 'P' else 'Covered Call'
+        return 'Put' if opt_type == 'P' else 'Call'
+
+    def _convert_legged_out_close(self, trade: Dict):
+        """
+        Reconcile a close that covers only some of an open row's legs.
+
+        A position legged out of comes off in whatever groups the orders filled
+        in, so no one order matches the row. Each closing order is reconciled
+        against just the legs it covers: the row is rewritten to hold those
+        legs alone - their own opening price against their own real closing
+        price - and every surviving leg is split out to a row of its own,
+        carrying what it was opened for. The rows always sum to the real total,
+        and every number in them is one that actually traded, which is what
+        makes them reconcilable against a broker statement.
+
+        This follows the split Kevin made by hand for the MSFT 430/410 spread
+        (see fix_msft_bps_321.py): the row keeps the closed legs and is renamed
+        for them, and the surviving leg is inserted directly below.
 
         Returns a (handled, ok) tuple, as _convert_four_leg_side_close does.
         """
-        status, detail = self._find_open_four_leg_for_orphan(trade)
+        status, detail = self._find_open_row_for_legged_out_close(trade)
 
         if status == 'already':
             print(f"⊘ Skipped duplicate legged-out close "
                   f"{trade.get('underlying')} {trade.get('strikes')} "
-                  f"(already carried out at row {detail})")
+                  f"(already split at row {detail})")
             return (True, True)
 
         if status == 'no_leg_data':
@@ -1131,20 +1185,24 @@ class SpreadsheetLogger:
                            f"Looks like part of the position at row {detail}, "
                            "but that row has no per-leg prices recorded - "
                            "split by hand")
-            print(f"✗ Four-leg row {detail} has no recorded per-leg prices "
+            print(f"✗ Row {detail} has no recorded per-leg prices "
                   f"- logged to Import Errors")
             return (True, False)
 
         if status != 'found':
             return (False, False)
 
-        parent_row_num, parent_row, orphans = detail
+        parent_row_num, parent_row, legs = detail
         parent_strategy = parent_row[3]
         quantity = int(float(parent_row[12] or 0))
         close_date = trade.get('trade_date', '')
 
+        closed = {(leg['strike'], leg['type'])
+                  for leg in trade.get('leg_breakdown', [])}
+        survivors = {leg: data for leg, data in legs.items() if leg not in closed}
+
         # Closing only some of the contracts would leave part of every leg
-        # open, which a whole-row conversion can't represent.
+        # open, which a whole-row rewrite can't represent.
         close_qty = trade.get('quantity', 0)
         if close_qty != quantity:
             self.log_error(trade,
@@ -1156,65 +1214,76 @@ class SpreadsheetLogger:
                   f"{quantity}, closing {close_qty}) - logged to Import Errors")
             return (True, False)
 
-        # Fees are informational - P&L uses columns K and L only - so the
-        # opening fees split by leg count rather than being re-derived.
-        n_closed = len(trade.get('leg_breakdown', []))
-        open_fees = self._parse_money(parent_row[9])
-        parent_fees = open_fees * n_closed / (n_closed + len(orphans))
-        orphan_fees = (open_fees - parent_fees) / len(orphans)
+        # 1. Rewrite the row to hold only the legs this order closed, against
+        #    their own share of the opening price. Both columns are then real
+        #    figures: the legs' actual opening price and their actual close.
+        closed_open = sum(legs[leg]['net_price'] for leg in closed)
+        closed_fees = sum(legs[leg]['fees'] for leg in closed)
+        close_net = trade.get('net_price', 0)
 
-        # 1. Close the four-leg row, carrying the survivors' opening price out.
-        carried = sum(orphans.values())
-        closing_trade = dict(trade)
-        closing_trade['net_price'] = trade.get('net_price', 0) - carried
-        if not self.update_close_trade(
-                parent_row_num, closing_trade,
-                fees_override=parent_fees + trade.get('fees', 0)):
-            self.log_error(trade, f"Failed to close {parent_strategy} row "
-                                  f"{parent_row_num} for legged-out close")
-            return (True, False)
+        updates = [
+            {'range': f'B{parent_row_num}', 'values': [[self._parse_date(close_date)]]},
+            {'range': f'E{parent_row_num}', 'values': [['Closed']]},
+            {'range': f'J{parent_row_num}', 'values': [[closed_fees + trade.get('fees', 0)]]},
+            {'range': f'K{parent_row_num}', 'values': [[closed_open]]},
+            {'range': f'L{parent_row_num}', 'values': [[close_net]]},
+            {'range': f'N{parent_row_num}', 'values': [[closed_open + close_net]]},
+        ]
 
-        # 2. Open each surviving leg as a position in its own right, keeping the
-        #    four-leg row's entry date because that is when the risk went on.
-        #    Its own eventual close is then an ordinary single-leg close.
+        # A single remaining leg has a name of its own in the log, so the row
+        # is renamed for what it actually held and the strike that left is
+        # cleared. More than one and there is no such name - the label stands.
+        if len(closed) == 1:
+            (strike, opt_type), = closed
+            leg_strategy = self._leg_strategy(opt_type, closed_open)
+            short = f"${strike:,.2f}" if closed_open >= 0 else ''
+            updates += [
+                {'range': f'D{parent_row_num}', 'values': [[leg_strategy]]},
+                {'range': f'G{parent_row_num}', 'values': [[short]]},
+                {'range': f'H{parent_row_num}', 'values': [['' if short else f"${strike:,.2f}"]]},
+            ]
+
+        self.sheet.batch_update(updates, value_input_option='USER_ENTERED')
+
+        # 2. Split each surviving leg out to its own row, directly below, so the
+        #    two sit together and the survivor keeps the original entry date -
+        #    that is when its risk went on. Its own eventual close is then an
+        #    ordinary single-leg close needing no special handling.
         new_rows = []
-        for (strike, opt_type), price in sorted(orphans.items()):
-            if price >= 0:
-                # A credit received means the leg was sold.
-                strategy = 'CSP' if opt_type == 'P' else 'Covered Call'
-            else:
-                strategy = 'Put' if opt_type == 'P' else 'Call'
-
-            orphan_trade = {
+        for offset, ((strike, opt_type), data) in enumerate(sorted(survivors.items())):
+            price = data['net_price']
+            survivor_trade = {
                 'action': 'OPEN',
                 'underlying': trade.get('underlying', ''),
-                'strategy': strategy,
+                'strategy': self._leg_strategy(opt_type, price),
                 'trade_date': parent_row[0],
                 'expiration': trade.get('expiration', ''),
                 'strikes': f"${strike:,.2f}{opt_type}",
                 'quantity': quantity,
                 'net_price': price,
-                'fees': orphan_fees,
+                'fees': data['fees'],
+                'leg_breakdown': [{'strike': strike, 'type': opt_type,
+                                   'net_price': price, 'fees': data['fees']}],
             }
-            row = self.format_trade_row(orphan_trade)
+            row = self.format_trade_row(survivor_trade)
             row[15] = (f"${strike:,.2f}{opt_type} leg of {parent_strategy} "
-                       f"(row {parent_row_num}), carried out {close_date}")
-            new_row_num = self._append_row_at_column_a(row)
+                       f"(row {parent_row_num}), split out {close_date}")
+            new_row_num = parent_row_num + 1 + offset
+            self.sheet.insert_row(row, new_row_num, value_input_option='USER_ENTERED')
             self.format_new_row(new_row_num)
             new_rows.append(new_row_num)
 
-        # 3. Mark the four-leg row, so a re-run inside the lookback window
-        #    recognises the conversion instead of applying it a second time.
+        # 3. Mark the row, so a re-run inside the lookback window recognises
+        #    the split instead of applying it a second time.
         self.sheet.update_acell(
             f'P{parent_row_num}',
             f"{parent_row[15]} | legged out {close_date} -> "
-            f"row {', '.join(str(n) for n in new_rows)}")
+            f"row {', '.join(str(n) for n in new_rows)}".lstrip(' |'))
 
-        print(f"⚙ {parent_strategy} row {parent_row_num}: closed "
-              f"{n_closed} of {n_closed + len(orphans)} legs, carried "
-              f"{', '.join(f'${s:,.2f}{t}' for s, t in sorted(orphans))} "
-              f"(${carried:,.2f}) out to row "
-              f"{', '.join(str(n) for n in new_rows)}")
+        print(f"\u2699 {parent_strategy} row {parent_row_num}: closed "
+              f"{', '.join(f'${s:,.2f}{t}' for s, t in sorted(closed))}, "
+              f"split {', '.join(f'${s:,.2f}{t}' for s, t in sorted(survivors))} "
+              f"out to row {', '.join(str(n) for n in new_rows)}")
         return (True, True)
 
     def _close_matching_open_rows(self, close_trade: Dict):
@@ -1411,10 +1480,10 @@ class SpreadsheetLogger:
                             self.clear_error(trade)
                         return ok
 
-                    # Or most of a four-leg position, if it was legged out of
-                    # rather than exited a side at a time, leaving a single leg
-                    # still running.
-                    handled, ok = self._convert_four_leg_orphan_close(trade)
+                    # Or only some of a position's legs, if it was legged out
+                    # of rather than closed as a whole or a side at a time,
+                    # leaving the rest still running.
+                    handled, ok = self._convert_legged_out_close(trade)
                     if handled:
                         if ok:
                             self.clear_error(trade)

@@ -32,3 +32,4 @@ logs/
 !evals/inputs/ic_side_close_now.json
 !evals/inputs/superbull_now.json
 !evals/inputs/legged_out_iren.json
+!evals/inputs/legged_out_dram.json

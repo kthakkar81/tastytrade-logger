@@ -35,6 +35,19 @@ STOCK_LOG_HEADER = ['Entry Date', 'Exit Date', 'Ticker', 'Status', 'Qty',
 # already entered by hand, and there is nowhere to put a dividend.
 EQUITY_RECEIVE_DELIVER_SUBTYPES = {'Assignment', 'Exercise'}
 
+# Where the logger records what each leg of a multi-leg position was opened
+# for. A position can be legged out of - closed a leg or two at a time, across
+# several orders - and each closing order then has to be reconciled against
+# just the legs it covers. That split cannot be recovered from the closing
+# fills, so it is written down when the position is opened.
+#
+# It lives in its own column rather than in Notes because Notes/Setup is
+# Kevin's ("Stop Loss", setup descriptions) and shouldn't fill up with logger
+# bookkeeping. Q is the first column past the sheet's own P, and Q:Y are empty
+# throughout the log.
+OPTIONS_LOG_LEG_COL = 'Q'
+OPTIONS_LOG_LEG_COL_INDEX = 16  # 0-based, matches get_all_values() rows
+
 # Four-leg strategies: a call vertical and a put vertical held as one position
 # and logged on one row, with all four strikes in Notes because the sheet has
 # room for a single short/long pair.

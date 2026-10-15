@@ -182,6 +182,13 @@ class TransactionProcessor:
         if trade['strategy'] in config.FOUR_LEG_STRATEGIES:
             trade['side_breakdown'] = self._split_vertical_sides(legs)
 
+        # Any multi-leg position can also be legged out of, a leg or two at a
+        # time across several orders, and each closing order is then reconciled
+        # against just the legs it covers. Same reasoning as the side split, one
+        # level finer, and equally unrecoverable from the closing fills.
+        if len(legs) > 1:
+            trade['leg_breakdown'] = [self._leg_breakdown(leg) for leg in legs]
+
         return trade
 
     def _process_close(self, order_id: str, legs: List[Dict]) -> Dict:
@@ -332,6 +339,12 @@ class TransactionProcessor:
         # - otherwise a later side-only exit has nothing to divide.
         if roll['new_strategy'] in config.FOUR_LEG_STRATEGIES:
             roll['side_breakdown'] = self._split_vertical_sides(opening_legs)
+
+        # Likewise the per-leg split, for a rolled-into position later legged
+        # out of one order at a time.
+        if len(opening_legs) > 1:
+            roll['leg_breakdown'] = [self._leg_breakdown(leg)
+                                     for leg in opening_legs]
 
         return roll
 
@@ -550,18 +563,19 @@ class TransactionProcessor:
 
     def _leg_breakdown(self, leg: Dict) -> Dict:
         """
-        One leg's strike, type and signed share of the opening price.
+        One leg's strike, type, and signed share of the price and fees.
 
-        A four-leg position isn't only unwound a side at a time - it can be
-        legged out of, which leaves a single leg standing on its own with no
-        way to recover its share of the opening price from the closing fills.
-        Recording it here, while the whole order is in hand, is the per-leg
-        equivalent of what _split_vertical_sides does for each side.
+        A multi-leg position isn't only unwound a side at a time - it can be
+        legged out of, which leaves individual legs standing on their own with
+        no way to recover their share of the opening price from the closing
+        fills. Recording it here, while the whole order is in hand, is the
+        per-leg equivalent of what _split_vertical_sides does for each side.
         """
         return {
             'strike': self._extract_strike_from_symbol(leg.get('symbol', '')),
             'type': self._option_type(leg),
             'net_price': self._calculate_net_price([leg]),
+            'fees': self._calculate_fees([leg]),
         }
 
     def _calculate_net_price(self, legs: List[Dict]) -> float:
