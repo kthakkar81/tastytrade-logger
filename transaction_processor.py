@@ -190,6 +190,11 @@ class TransactionProcessor:
             'action': 'CLOSE',
             'order_id': order_id,
             'legs': legs,
+            # Which legs this close actually covers, by strike and type. A
+            # close that takes only part of a position is matched by working
+            # out which of the open row's legs are missing from this list,
+            # which is more reliable than comparing strike strings.
+            'leg_breakdown': [self._leg_breakdown(leg) for leg in legs],
             'underlying': self._get_underlying(legs[0]),
             'strategy': self._classify_closing_strategy(legs),
             'trade_date': self._get_trade_date(legs[0]),
@@ -538,8 +543,25 @@ class TransactionProcessor:
                 'strikes': self._get_strikes(side_legs),
                 'net_price': self._calculate_net_price(side_legs),
                 'fees': self._calculate_fees(side_legs),
+                'legs': [self._leg_breakdown(leg) for leg in side_legs],
             }
             for opt_type, side_legs in sides.items()
+        }
+
+    def _leg_breakdown(self, leg: Dict) -> Dict:
+        """
+        One leg's strike, type and signed share of the opening price.
+
+        A four-leg position isn't only unwound a side at a time - it can be
+        legged out of, which leaves a single leg standing on its own with no
+        way to recover its share of the opening price from the closing fills.
+        Recording it here, while the whole order is in hand, is the per-leg
+        equivalent of what _split_vertical_sides does for each side.
+        """
+        return {
+            'strike': self._extract_strike_from_symbol(leg.get('symbol', '')),
+            'type': self._option_type(leg),
+            'net_price': self._calculate_net_price([leg]),
         }
 
     def _calculate_net_price(self, legs: List[Dict]) -> float:
@@ -767,11 +789,48 @@ class TransactionProcessor:
 
                     return 'Bull Call Spread'
 
+        elif num_legs == 3:
+            # Three legs is a four-leg position being legged out of rather than
+            # exited a side at a time: one whole vertical plus a single leg of
+            # the other, with the fourth left open. Naming it for the parent
+            # position is what routes it to the four-leg handling instead of
+            # dying here as unclassifiable.
+            return self._classify_three_leg_close(legs)
+
         elif num_legs == 4:
             # Iron condor or superbull, told apart by the call vertical
             return self._classify_four_leg(legs, closing=True)
 
         return 'Unknown'
+
+    def _classify_three_leg_close(self, legs: List[Dict]) -> str:
+        """
+        Name the four-leg position that a 3-leg close is part of.
+
+        When the whole side being closed is the calls, its direction identifies
+        the strategy exactly as it does for a full four-leg order. When it's the
+        puts, the two strategies are indistinguishable from that side - they
+        share a bull put spread - so this falls back to 'IC', the same default
+        _classify_four_leg uses. The label only has to be a four-leg strategy:
+        the parent row is matched on its strikes, not on this name.
+        """
+        by_type = {'C': [], 'P': []}
+        for leg in legs:
+            opt_type = self._option_type(leg)
+            if opt_type not in by_type:
+                return 'Unknown'
+            by_type[opt_type].append(leg)
+
+        # One side whole, one leg of the other - anything else isn't a
+        # four-leg position part-way out.
+        if sorted(len(ls) for ls in by_type.values()) != [1, 2]:
+            return 'Unknown'
+
+        if len(by_type['C']) == 2:
+            call_side = self._classify_closing_strategy(by_type['C'])
+            return FOUR_LEG_BY_CALL_SIDE.get(call_side, 'IC')
+
+        return 'IC'
 
 
 # Test function
