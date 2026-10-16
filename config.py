@@ -35,6 +35,18 @@ STOCK_LOG_HEADER = ['Entry Date', 'Exit Date', 'Ticker', 'Status', 'Qty',
 # already entered by hand, and there is nowhere to put a dividend.
 EQUITY_RECEIVE_DELIVER_SUBTYPES = {'Assignment', 'Exercise'}
 
+# Single-leg strategies that are short the option rather than long it. Their
+# strike belongs in the short column; a long leg's belongs in the long one.
+#
+# 'Short Call' is what a sold call becomes when the long call that covered it
+# is closed first - a naked call, not a covered one. Labelling it 'Covered
+# Call' would claim 100 shares per contract backing a position with unlimited
+# upside risk. A sold put keeps 'CSP', which is what Kevin called the leftover
+# short leg of the MSFT spread he split by hand (fix_msft_bps_321.py).
+#
+# These must be exactly the sheet's Strategy Type validation values.
+SHORT_SINGLE_LEG_STRATEGIES = ('CSP', 'Covered Call', 'Short Call')
+
 # Where the logger records what each leg of a multi-leg position was opened
 # for. A position can be legged out of - closed a leg or two at a time, across
 # several orders - and each closing order then has to be reconciled against

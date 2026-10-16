@@ -277,6 +277,83 @@ def test_dram_long_leg_runs_on_and_then_closes(dram):
         pytest.approx(2844.96, abs=0.02)
 
 
+# --- what a leg standing on its own gets called -----------------------------
+
+def test_a_sold_call_is_short_not_covered():
+    """
+    A sold call whose long call was closed first is naked. Calling it a
+    'Covered Call' would claim 100 shares per contract behind a position with
+    unlimited upside risk - the one label that reads safer than the position is.
+    """
+    assert SpreadsheetLogger._leg_strategy('C', 75.51) == 'Short Call'
+    assert SpreadsheetLogger._leg_strategy('C', -108.48) == 'Call'
+    # A sold put keeps CSP, which is what the MSFT spread's leftover short leg
+    # was called when it was split by hand.
+    assert SpreadsheetLogger._leg_strategy('P', 487.50) == 'CSP'
+    assert SpreadsheetLogger._leg_strategy('P', -364.48) == 'Put'
+
+
+def test_short_leg_strikes_go_in_the_short_column():
+    """Being short is what the short strike column means, for any single leg."""
+    logger = SpreadsheetLogger('stub')
+    base = {'action': 'OPEN', 'underlying': 'IREN', 'trade_date': '10/12/2026',
+            'expiration': '10/30/2026', 'quantity': 4, 'fees': 4.49}
+
+    short_call = logger.format_trade_row(
+        dict(base, strategy='Short Call', strikes='$46.00C', net_price=75.51))
+    assert (short_call[6], short_call[7]) == ('$46.00', '')
+
+    long_put = logger.format_trade_row(
+        dict(base, strategy='Put', strikes='$32.00P', net_price=-364.48))
+    assert (long_put[6], long_put[7]) == ('', '$32.00')
+
+
+def test_every_leg_label_is_a_value_the_sheet_accepts():
+    """
+    Rows are matched by comparing the computed label to the cell, so a label
+    the Strategy Type validation doesn't list silently orphans its row.
+    """
+    import config
+    accepted = {'CSP', 'Covered Call', 'Short Call', 'Put', 'Call'}
+    for opt_type in ('C', 'P'):
+        for price in (123.45, -123.45):
+            assert SpreadsheetLogger._leg_strategy(opt_type, price) in accepted
+    assert 'Short Call' in config.SHORT_SINGLE_LEG_STRATEGIES
+
+
+# --- the order closes are applied in ----------------------------------------
+
+def test_the_close_covering_most_legs_is_applied_first(iren):
+    """
+    Both IREN closes share a date, so the sort has to break the tie. Applying
+    the single leg first splits the other three off to rows of their own, and
+    the order covering those three then has nothing whole left to match - which
+    is exactly what happened on the production run of 2026-10-15.
+    """
+    open_trade, three_leg, lone_put = iren
+    logger = make_logger(open_trade)
+
+    seen = []
+    logger.append_trade = lambda trade: seen.append(trade['strikes']) or True
+    logger.append_trades([lone_put, three_leg])  # worst-case input order
+
+    assert seen == ['$46.00/$45.00/$33.00', '$32.00P']
+
+
+def test_either_input_order_gives_the_same_two_rows(iren):
+    open_trade, three_leg, lone_put = iren
+    logger = make_logger(open_trade)
+
+    logger.append_trades([lone_put, three_leg])
+
+    assert len(logger.sheet.rows) == 3, 'expected the row plus one split-out leg'
+    parent, survivor = logger.sheet.rows[1], logger.sheet.rows[2]
+    assert (parent[3], parent[4]) == ('Super Bull', 'Closed')
+    assert float(parent[13]) == pytest.approx(-738.95, abs=0.02)
+    assert (survivor[3], survivor[4]) == ('Put', 'Closed')
+    assert float(survivor[13]) == pytest.approx(935.01, abs=0.02)
+
+
 # --- refusals and re-runs ---------------------------------------------------
 
 def test_rerun_does_not_split_twice(iren):

@@ -5,7 +5,9 @@ Writes processed trades to Google Sheets trading log
 from typing import List, Dict
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import functools
 import re
+import time
 import gspread
 from google.oauth2.service_account import Credentials
 import config
@@ -32,6 +34,73 @@ SIDE_NOTE_RE = re.compile(
 LEG_RE = re.compile(
     r'\$([\d,]+\.\d{2})([CP]) (credit|debit) \$(-?[\d,]+\.\d{2})'
     r'(?: fee \$(-?[\d,]+\.\d{2}))?')
+
+
+class _CachingWorksheet:
+    """
+    A worksheet that reads the grid once and waits out the read quota.
+
+    Every matching pass re-reads the whole sheet, and a sync does several per
+    trade, so a full lookback window could run to a few hundred reads. Sheets
+    caps reads per minute per user, and going over mid-run is the worst
+    outcome there is: on 2026-10-15 a run aborted part-way with some trades
+    written and some not, and never reached its own Sync Log row.
+
+    So the no-argument get_all_values() - the hot path - is served from one
+    copy per worksheet, and any call that could change the grid drops it
+    again. Doing both here, rather than at each call site, is what makes it
+    safe: every call goes through this one place, so a write cannot slip past
+    and leave a stale copy behind. Reads that pass arguments (a different
+    render option, say) are left alone and never cached.
+
+    Whatever still hits the quota waits and retries rather than dying, because
+    a slow sync beats a half-written log.
+    """
+
+    # Calls that can change what the grid holds. Formatting is not among them:
+    # it changes how cells look, not what they say.
+    MUTATORS = frozenset({
+        'update', 'batch_update', 'update_acell', 'update_cell', 'update_cells',
+        'append_row', 'append_rows', 'insert_row', 'insert_rows',
+        'delete_row', 'delete_rows', 'clear', 'batch_clear',
+    })
+
+    def __init__(self, worksheet, attempts=4, delay=20):
+        self._ws = worksheet
+        self._attempts = attempts
+        self._delay = delay
+        self._values = None
+
+    def __getattr__(self, name):
+        attr = getattr(self._ws, name)
+        if not callable(attr):
+            return attr
+
+        @functools.wraps(attr)
+        def call(*args, **kwargs):
+            if name in self.MUTATORS:
+                self._values = None
+
+            if name == 'get_all_values' and not args and not kwargs:
+                if self._values is None:
+                    self._values = self._retry(attr)
+                return [list(row) for row in self._values]
+
+            return self._retry(attr, *args, **kwargs)
+
+        return call
+
+    def _retry(self, func, *args, **kwargs):
+        for attempt in range(self._attempts):
+            try:
+                return func(*args, **kwargs)
+            except gspread.exceptions.APIError as exc:
+                over_quota = getattr(exc.response, 'status_code', None) == 429
+                if not over_quota or attempt == self._attempts - 1:
+                    raise
+                wait = self._delay * (attempt + 1)
+                print(f"⏳ Sheets quota reached — waiting {wait}s and retrying")
+                time.sleep(wait)
 
 
 class SpreadsheetLogger:
@@ -81,12 +150,15 @@ class SpreadsheetLogger:
             spreadsheet = self.client.open_by_key(self.spreadsheet_id)
             self.spreadsheet = spreadsheet
 
-            # Get first sheet (or specify sheet name if needed)
-            self.sheet = spreadsheet.sheet1
+            # Get first sheet (or specify sheet name if needed). Wrapped so the
+            # repeated whole-grid reads every matching pass makes are served
+            # from one copy, and a brush with the read quota waits rather than
+            # aborting the run half-written.
+            self.sheet = _CachingWorksheet(spreadsheet.sheet1)
 
             # Get or create error log sheet
             try:
-                self.error_sheet = spreadsheet.worksheet('Import Errors')
+                self.error_sheet = _CachingWorksheet(spreadsheet.worksheet('Import Errors'))
                 # Verify header exists and is correct
                 first_row = self.error_sheet.row_values(1)
                 expected_header = ['Date', 'Underlying', 'Strategy', 'Expiration',
@@ -97,7 +169,8 @@ class SpreadsheetLogger:
                     self.error_sheet.append_row(expected_header)
             except gspread.exceptions.WorksheetNotFound:
                 # Create error sheet if it doesn't exist
-                self.error_sheet = spreadsheet.add_worksheet(title='Import Errors', rows=100, cols=10)
+                self.error_sheet = _CachingWorksheet(
+                    spreadsheet.add_worksheet(title='Import Errors', rows=100, cols=10))
                 # Add header row
                 self.error_sheet.append_row([
                     'Date', 'Underlying', 'Strategy', 'Expiration',
@@ -107,7 +180,8 @@ class SpreadsheetLogger:
             # Equity log. Absence is not fatal — options syncing still works,
             # and stock trades fall through to Import Errors where they're visible.
             try:
-                self.stock_sheet = spreadsheet.worksheet(config.SHEET_STOCK_LOG)
+                self.stock_sheet = _CachingWorksheet(
+                    spreadsheet.worksheet(config.SHEET_STOCK_LOG))
                 if self.stock_sheet.row_values(1) != config.STOCK_LOG_HEADER:
                     print(f"⚠ '{config.SHEET_STOCK_LOG}' header differs from "
                           f"expected {config.STOCK_LOG_HEADER} — not modifying it")
@@ -329,8 +403,9 @@ class SpreadsheetLogger:
         parts = clean_str.split('/')
 
         if len(parts) == 1:
-            # Single leg (CSP, Covered Call, Long Put/Call)
-            if strategy in ['CSP', 'Covered Call']:
+            # Single leg: short ones (CSP, Covered Call, Short Call) take the
+            # short strike column, a long put or call the long one.
+            if strategy in config.SHORT_SINGLE_LEG_STRATEGIES:
                 result['short'] = parts[0]
             else:
                 result['long'] = parts[0]
@@ -1150,7 +1225,7 @@ class SpreadsheetLogger:
         bought - the same four names the log already uses for one-leg rows.
         """
         if net_price >= 0:
-            return 'CSP' if opt_type == 'P' else 'Covered Call'
+            return 'CSP' if opt_type == 'P' else 'Short Call'
         return 'Put' if opt_type == 'P' else 'Call'
 
     def _convert_legged_out_close(self, trade: Dict):
@@ -2319,9 +2394,11 @@ class SpreadsheetLogger:
                 print("⚠ Cannot write Sync Log: spreadsheet not authenticated")
                 return False
 
-            # Get or create the Sync Log worksheet
+            # Get or create the Sync Log worksheet. Wrapped like the rest: this
+            # row is how "did it run?" gets answered, so it is the last thing
+            # that should be lost to a brush with the read quota.
             try:
-                log_sheet = self.spreadsheet.worksheet('Sync Log')
+                log_sheet = _CachingWorksheet(self.spreadsheet.worksheet('Sync Log'))
                 if log_sheet.row_values(1) != SYNC_LOG_HEADER:
                     log_sheet.clear()
                     log_sheet.append_row(SYNC_LOG_HEADER)
@@ -2362,7 +2439,14 @@ class SpreadsheetLogger:
             date = trade.get('trade_date', '')
             # OPEN=0, ROLL=1, CLOSE=2 for sorting
             action_priority = {'OPEN': 0, 'ROLL': 1, 'CLOSE': 2}.get(action, 3)
-            return (date, action_priority)
+            # Among closes that sort together, the one covering the most legs
+            # goes first. A position legged out of can only be matched while
+            # its legs are still together on one row: close a single leg first
+            # and it is split off to its own row, leaving the order that covers
+            # the group it belonged to with nothing whole to match. Negated so
+            # that more legs sorts earlier.
+            widest_first = -len(trade.get('leg_breakdown', []))
+            return (date, action_priority, widest_first)
 
         sorted_trades = sorted(trades, key=sort_key)
 
